@@ -109,8 +109,10 @@ impl Keys {
 struct RawMode {
     fd: RawFd,
     original: libc::termios,
-    /// Foreground group before this node claimed it, when it had to.
-    original_foreground: Option<libc::pid_t>,
+    /// The terminal's foreground group before this node ran.
+    foreground: Option<libc::pid_t>,
+    /// Whether this node had to take the foreground itself.
+    claimed: bool,
 }
 
 impl RawMode {
@@ -136,23 +138,26 @@ impl RawMode {
         Ok(Self {
             fd,
             original,
-            original_foreground: None,
+            foreground: None,
+            claimed: false,
         })
     }
 
-    /// dora spawns nodes from its daemon, and the node can land in a background
-    /// process group: the tty opens and goes raw, but the first read fails with
-    /// EIO. Take the foreground here, and give it back on drop so the second
-    /// Ctrl-C still reaches dora.
+    /// dora gives each node its own process group, so the node lands in the
+    /// background and the first tty read would fail with EIO. Take the
+    /// foreground here, and give it back on drop so a later Ctrl-C reaches dora.
     fn claim_terminal(&mut self) {
         let pgrp = unsafe { libc::getpgrp() };
         let foreground = unsafe { libc::tcgetpgrp(self.fd) };
         eprintln!("dora-keyboard: /dev/tty ready (pgrp {pgrp}, foreground {foreground})");
+        if foreground > 0 {
+            self.foreground = Some(foreground);
+        }
         if foreground < 0 || foreground == pgrp {
             return;
         }
         if unsafe { libc::tcsetpgrp(self.fd, pgrp) } == 0 {
-            self.original_foreground = Some(foreground);
+            self.claimed = true;
             eprintln!(
                 "dora-keyboard: took the terminal's foreground group ({foreground} -> {pgrp})"
             );
@@ -167,7 +172,9 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        if let Some(foreground) = self.original_foreground.take() {
+        if self.claimed
+            && let Some(foreground) = self.foreground
+        {
             unsafe {
                 libc::tcsetpgrp(self.fd, foreground);
             }
@@ -252,6 +259,9 @@ fn main() -> Result<()> {
         }
     }
 
+    let interrupted = keys.lock().expect("keyboard state poisoned").quit;
+    let foreground = raw_mode.as_ref().and_then(|raw| raw.foreground);
+
     // A final zero does not wait for robotd's deadman on a graceful stop.
     let _ = node.send_output(
         DataId::from(CMD_VEL.to_owned()),
@@ -260,6 +270,18 @@ fn main() -> Result<()> {
     );
 
     drop(raw_mode);
+
+    // dora gives each node its own process group, so the Ctrl-C read in raw mode
+    // only reached this node. Restore the terminal first, then send the SIGINT
+    // the terminal would have sent: dora stops and the launcher takes the twin
+    // down with one keypress.
+    if interrupted && let Some(pgrp) = foreground {
+        eprintln!("dora-keyboard: Ctrl-C — stopping the dataflow");
+        unsafe {
+            libc::kill(-pgrp, libc::SIGINT);
+        }
+    }
+
     Ok(())
 }
 

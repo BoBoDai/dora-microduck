@@ -114,8 +114,8 @@ cmd_run() {
         STARTED=1
     fi
 
-    say "keyboard: W/S vx, A/D vy, Q/E turn, X stop, Ctrl-C quits the keyboard node"
-    say "a second Ctrl-C stops the dataflow; this script then takes the twin down"
+    say "keyboard: W/S vx, A/D vy, Q/E turn, X stop, Ctrl-C stops the dataflow"
+    say "this script then takes the twin down"
     ROBOTD_SOCKET="$SOCK" dora run "$ROOT/dataflows/sim.yml" "$@"
 }
 
