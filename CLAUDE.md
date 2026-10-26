@@ -60,7 +60,7 @@ dora graph dataflows/sim.yml --mermaid
 
 ### Nodes
 
-- `crates/dora-keyboard` — reads keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. Hold to move: W/S vx, A/D vy, Q/E yaw; X stops immediately. Terminals report no key-up, so a key is held while it repeats — the first window is 800 ms to cover the OS repeat delay, then 250 ms once repeats are flowing. Ctrl-C quits and restores the terminal, then signals dora's process group so one press stops the dataflow. Arrow and space sequences are swallowed on purpose — the MuJoCo viewer binds them to stepping and pausing. dora can spawn the node in a background process group, so it claims the tty's foreground group and restores it on exit; `first key received` in the node log confirms input works. Defaults are 0.30 / 0.15 / 0.50; 0.30 is above the ~0.25 m/s deadband the MuJoCo twin shows. Without a tty it warns and publishes zeros.
+- `crates/dora-keyboard` — reads keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. Hold to move: W/S vx, A/D vy, Q/E yaw; X stops immediately. Terminals report no key-up, so a key is held while it repeats — the first window is 800 ms to cover the OS repeat delay, then 250 ms once repeats are flowing. Ctrl-C quits and restores the terminal, then signals dora's process group so one press stops the dataflow. Arrow and space sequences are swallowed on purpose — the MuJoCo viewer binds them to stepping and pausing. The parser consumes whole escape sequences (CSI with parameters, SS3, `ESC`+key) rather than one byte after `ESC [`, because a stray final `D` would strafe. dora can spawn the node in a background process group, so it claims the tty's foreground group and restores it on exit; `first key received` in the node log confirms input works. Defaults are 0.30 / 0.50 / 1.50: the walking policy ignores strafe below ~0.4 m/s and barely yaws below ~1.2 rad/s, so smaller "gentle" values only wobble the duck. Without a tty it warns and publishes zeros.
 - `crates/dora-mujoco-bridge` — owns the clock (`dora/timer/millis/10`), advances the simulation, publishes `joint_state`. Currently a deterministic synthetic gait; the MuJoCo binding is still a TODO.
 - `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It also consumes `joint_state`, validates the length against `duck_ipc_proto::JOINT_NAMES` (15 joints), and publishes `joint_command`; that mirror is the stub for the real state stream.
 
@@ -87,8 +87,9 @@ dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-w
 
 1. It extracts the MuJoCo body from `microduck_rl` (`origin/develop`, overridable with `MICRODUCK_RL_REF`) into `target/duck-sim/rl`, symlinks that checkout's `.venv`, and never modifies the other repository. Override the source checkout with `MICRODUCK_RL`.
 2. It starts the upstream `vendor/microduck/scripts/duck-sim`, which owns daemon build, policy fetch, params, sockets, health checks and standing.
-3. It exports `ROBOTD_SOCKET` and runs `dora run` in the foreground.
-4. On exit it runs `duck-sim down` **only if it started the twin**; an already-running twin is left alone.
+3. It turns terminal echo off first (`stty -g` saved, restored by the exit trap). The twin takes about ten seconds to come up, and the keyboard node does not exist until after that; without this, keys pressed while waiting are echoed by the driver as `^[[A`.
+4. It exports `ROBOTD_SOCKET` and runs `dora run` in the foreground.
+5. On exit it runs `duck-sim down` **only if it started the twin**; an already-running twin is left alone.
 
 Do **not** turn the upstream daemons into dora nodes. `robotd` is binary-only and safety-critical; `btd`/`configd`/`updaterd` must survive a dead `robotd` and depend on systemd units and socket permissions. Dora owns the graph; systemd/upstream owns the daemons. The one seam worth taking over later is the MuJoCo body protocol from `duck_control::sim` (`hello/read/write/gain/torque/slow`, protocol 1).
 
@@ -157,7 +158,7 @@ build(deps): bump dora to 1.1.0
 ### When to commit and push
 
 - Commit only when the user asks; do not commit as a side effect of another task.
-- Push only when the user asks. This repo currently has **no remote** configured.
+- Push only when the user asks. The remote is `origin` = `git@github.com:BoBoDai/dora-microduck.git` (SSH; HTTPS auth failed).
 - `main` is the only branch and the first commit is its root commit. If a remote and a shared default branch are added later, put new work on a topic branch instead of committing to the default branch directly.
 - Before committing, run `cargo clippy --workspace --all-targets -- -D warnings`; for dataflow changes also run the 4-second `dora run` smoke test from the Commands section.
 

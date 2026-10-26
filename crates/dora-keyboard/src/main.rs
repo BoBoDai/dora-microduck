@@ -7,6 +7,9 @@
 //! once repeats are flowing the timeout is short and release stops promptly.
 //! X stops immediately, and Ctrl-C stops the whole dataflow.
 //!
+//! Every escape sequence the terminal can send for an arrow or function key is
+//! consumed, so its final byte (`A` in `ESC [ A`) never reads as a command.
+//!
 //! Run the dataflow from a terminal: without a controlling terminal the node
 //! logs a warning and publishes zeros instead of failing.
 
@@ -25,8 +28,25 @@ const HOLD_START: Duration = Duration::from_millis(800);
 const HOLD_REPEAT: Duration = Duration::from_millis(250);
 /// Above the ~0.25 m/s deadband the MuJoCo twin shows at low commands.
 const VX: f32 = 0.30;
-const VY: f32 = 0.15;
-const VYAW: f32 = 0.50;
+/// Strafe is ignored below about 0.4 m/s by the walking policy; 0.15 did nothing.
+const VY: f32 = 0.50;
+/// The policy barely turns below about 1.2 rad/s; 0.5 only wobbled.
+const VYAW: f32 = 1.50;
+
+/// A partial escape sequence is abandoned after this long. Terminals send one
+/// sequence in a single burst, so only a stray Esc key ever hits it.
+const ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Which part of an escape sequence is being consumed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    /// Saw ESC; the next byte decides what follows.
+    Start,
+    /// `ESC [` — parameters run to a final byte in `0x40..=0x7e`.
+    Csi,
+    /// `ESC O` — one final byte follows.
+    Ss3,
+}
 
 #[derive(Default)]
 struct Keys {
@@ -39,21 +59,31 @@ struct Keys {
     last_at: Option<Instant>,
     /// Whether a repeat has arrived for the current press.
     repeating: bool,
-    /// 0 = idle, 1 = saw ESC, 2 = saw `ESC [`.
-    escape: u8,
+    escape: Option<Escape>,
+    escape_at: Option<Instant>,
 }
 
 impl Keys {
     fn apply(&mut self, byte: u8) {
-        if self.escape == 1 {
-            self.escape = if byte == b'[' { 2 } else { 0 };
-            return;
-        }
-        if self.escape == 2 {
-            // Swallow the final byte of an escape sequence. Arrow keys and
-            // function keys end in letters that mean something here otherwise —
-            // `ESC [ D` (left arrow) would read as a strafe.
-            self.escape = 0;
+        if let Some(state) = self.escape {
+            self.escape = match state {
+                // `ESC [ 1 ; 5 D`, `ESC O D`, and `ESC w` (Option+key) all end
+                // elsewhere; consuming to the end keeps `D` from strafing.
+                Escape::Start => match byte {
+                    b'[' => Some(Escape::Csi),
+                    b'O' => Some(Escape::Ss3),
+                    _ => None,
+                },
+                Escape::Csi => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        None
+                    } else {
+                        Some(Escape::Csi)
+                    }
+                }
+                Escape::Ss3 => None,
+            };
+            self.escape_at = Some(Instant::now());
             return;
         }
 
@@ -67,7 +97,10 @@ impl Keys {
         }
 
         match byte {
-            0x1b => self.escape = 1,
+            0x1b => {
+                self.escape = Some(Escape::Start);
+                self.escape_at = Some(Instant::now());
+            }
             b'w' | b'W' => self.set_vx(VX),
             b's' | b'S' => self.set_vx(-VX),
             b'a' | b'A' => self.set_vy(VY),
@@ -107,6 +140,14 @@ impl Keys {
     fn command(&mut self) -> [f32; 3] {
         if self.quit {
             return [0.0; 3];
+        }
+        // A lone Esc press leaves the parser waiting for a sequence that never
+        // comes; let the next key through instead of swallowing it forever.
+        if let Some(at) = self.escape_at
+            && at.elapsed() > ESCAPE_TIMEOUT
+        {
+            self.escape = None;
+            self.escape_at = None;
         }
         if let Some(at) = self.last_at {
             let timeout = if self.repeating {
@@ -169,6 +210,12 @@ impl RawMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        // Keys pressed before raw mode existed — during the simulator's startup
+        // the terminal echoes them as `^[[A` — are still queued. Drop them so
+        // the node starts from nothing rather than replaying them.
+        unsafe {
+            libc::tcflush(fd, libc::TCIFLUSH);
+        }
         Ok(Self {
             fd,
             original,
@@ -213,7 +260,10 @@ impl Drop for RawMode {
                 libc::tcsetpgrp(self.fd, foreground);
             }
         }
+        // A key still held as the dataflow stops would otherwise be typed into
+        // the shell once echo comes back.
         unsafe {
+            libc::tcflush(self.fd, libc::TCIFLUSH);
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
@@ -356,6 +406,45 @@ mod tests {
         // not consumed first.
         let command = keys(b"\x1b[A\x1b[B\x1b[C\x1b[D").command();
         assert_eq!(command, [0.0; 3]);
+    }
+
+    #[test]
+    fn held_arrow_sequences_never_leak_a_command() {
+        // A held arrow key repeats the same sequence; not one of them may reach
+        // the command map.
+        let mut keys = Keys::default();
+        for _ in 0..40 {
+            for byte in b"\x1b[D\x1b[A\x1b[C\x1b[B" {
+                keys.apply(*byte);
+            }
+        }
+        assert_eq!(keys.command(), [0.0; 3]);
+        assert_eq!(keys.last_key, None);
+    }
+
+    #[test]
+    fn parametrised_and_ss3_sequences_are_swallowed() {
+        // iTerm2, Terminal.app's modified arrows, and application cursor mode.
+        assert_eq!(keys(b"\x1b[1;5D").command(), [0.0; 3]);
+        assert_eq!(keys(b"\x1b[1;2A").command(), [0.0; 3]);
+        assert_eq!(keys(b"\x1bOD").command(), [0.0; 3]);
+        assert_eq!(keys(b"\x1b[200~").command(), [0.0; 3]);
+    }
+
+    #[test]
+    fn option_key_is_swallowed() {
+        // Option+W arrives as `ESC w`; it must not walk the duck.
+        assert_eq!(keys(b"\x1bw").command(), [0.0; 3]);
+    }
+
+    #[test]
+    fn a_lone_escape_does_not_eat_the_next_key() {
+        let mut keys = Keys::default();
+        keys.apply(0x1b);
+        keys.escape_at = Some(Instant::now() - ESCAPE_TIMEOUT - Duration::from_millis(1));
+        let _ = keys.command();
+        keys.apply(b'w');
+        assert_eq!(keys.command(), [VX, 0.0, 0.0]);
     }
 
     #[test]

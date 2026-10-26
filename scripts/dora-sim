@@ -29,9 +29,25 @@ SOCK="$STATE/$DUCK.sock"
 SIM="$MICRODUCK/scripts/duck-sim"
 
 STARTED=0
+TTY_STATE=""
 
 say() { printf '\033[36m==\033[0m %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Until the keyboard node starts, the terminal is still in canonical mode with
+# echo on, so a key pressed while the twin comes up is echoed as `^[[A`. Turn
+# echo off up front; the node takes the terminal raw itself a few seconds later
+# and hands back this state, which the exit trap then restores.
+tty_save() {
+    TTY_STATE=$(stty -g < /dev/tty 2>/dev/null) || { TTY_STATE=""; return 0; }
+    stty -echo -icanon min 1 time 0 < /dev/tty 2>/dev/null || true
+}
+
+tty_restore() {
+    [ -n "$TTY_STATE" ] || return 0
+    stty "$TTY_STATE" < /dev/tty 2>/dev/null || true
+    TTY_STATE=""
+}
 
 usage() {
     sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
@@ -92,6 +108,7 @@ start_sim() {
 }
 
 cleanup() {
+    tty_restore
     if [ "$STARTED" = 1 ]; then
         say "stopping the MuJoCo twin"
         run_sim down >/dev/null 2>&1 || true
@@ -99,6 +116,10 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+# Without an INT trap the shell is killed outright and the EXIT trap never
+# runs, leaving the terminal with echo off and the twin running. Turning the
+# signal into a normal exit makes cleanup do both.
+trap 'exit 130' INT TERM
 
 cmd_run() {
     command -v cargo >/dev/null || die "cargo not found"
@@ -106,6 +127,8 @@ cmd_run() {
 
     say "building the dora nodes"
     ( cd "$ROOT" && cargo build --quiet -p dora-keyboard -p dora-robotd-wrapper -p dora-mujoco-bridge )
+
+    tty_save
 
     if is_up; then
         say "using the running twin at $SOCK"
