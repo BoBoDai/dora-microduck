@@ -7,6 +7,10 @@
 //! once repeats are flowing the timeout is short and release stops promptly.
 //! X stops immediately, and Ctrl-C stops the whole dataflow.
 //!
+//! Each axis keeps its own hold timer. A shared one let a key on one axis keep
+//! another axis's value alive: releasing W and holding A left `vx` latched, and
+//! the duck walked forward while strafing.
+//!
 //! Every escape sequence the terminal can send for an arrow or function key is
 //! consumed, so its final byte (`A` in `ESC [ A`) never reads as a command.
 //!
@@ -26,8 +30,11 @@ const CMD_VEL: &str = "cmd_vel";
 const HOLD_START: Duration = Duration::from_millis(800);
 /// Once repeats are flowing, this is the release timeout.
 const HOLD_REPEAT: Duration = Duration::from_millis(250);
-/// Above the ~0.25 m/s deadband the MuJoCo twin shows at low commands.
-const VX: f32 = 0.30;
+/// Above the ~0.25 m/s deadband the walking policy shows going forward.
+const VX_FORWARD: f32 = 0.30;
+/// The backward deadband is higher: measured on the twin, 0.30 moved nothing at
+/// all while 0.35 walked off every time, so this keeps a margin above the edge.
+const VX_BACKWARD: f32 = 0.40;
 /// Strafe is ignored below about 0.4 m/s by the walking policy; 0.15 did nothing.
 const VY: f32 = 0.50;
 /// The policy barely turns below about 1.2 rad/s; 0.5 only wobbled.
@@ -48,17 +55,60 @@ enum Escape {
     Ss3,
 }
 
+/// One axis of the command and the key currently holding it.
+///
+/// State per axis, not per command: a key pressed on one axis must not keep another
+/// axis's value alive. A single shared timer did exactly that — the repeats of A
+/// refreshed the timer that was holding W's `vx`, so a released W never expired.
+#[derive(Default)]
+struct Hold {
+    /// Last recognised key that set this axis, lower-cased; a repeat is the same
+    /// byte again.
+    key: Option<u8>,
+    last_at: Option<Instant>,
+    /// Whether a repeat has arrived for the current press.
+    repeating: bool,
+}
+
+impl Hold {
+    /// Records a press of `key`. A different key starts a new press and gets the
+    /// long initial window until its own repeats begin.
+    fn press(&mut self, key: u8) {
+        self.repeating = self.key == Some(key);
+        self.key = Some(key);
+        self.last_at = Some(Instant::now());
+    }
+
+    /// Whether the axis is still held, ending it once its key stops repeating.
+    ///
+    /// Clearing on expiry matters: pressing the same key again later must read as a
+    /// fresh press with the long window, not as a repeat of a press long released.
+    fn held(&mut self) -> bool {
+        let Some(at) = self.last_at else {
+            return false;
+        };
+        let timeout = if self.repeating {
+            HOLD_REPEAT
+        } else {
+            HOLD_START
+        };
+        if at.elapsed() > timeout {
+            *self = Self::default();
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Default)]
 struct Keys {
     vx: f32,
     vy: f32,
     vyaw: f32,
+    vx_hold: Hold,
+    vy_hold: Hold,
+    vyaw_hold: Hold,
     quit: bool,
-    /// Last recognised key, lower-cased; a repeat is the same byte again.
-    last_key: Option<u8>,
-    last_at: Option<Instant>,
-    /// Whether a repeat has arrived for the current press.
-    repeating: bool,
     escape: Option<Escape>,
     escape_at: Option<Instant>,
 }
@@ -88,12 +138,13 @@ impl Keys {
         }
 
         if let Some(key) = recognised(byte) {
-            let repeat = self.last_key == Some(key);
-            self.last_key = Some(key);
-            self.last_at = Some(Instant::now());
-            // A different key starts a new press: give it the long initial
-            // window until its own repeats begin.
-            self.repeating = repeat;
+            match key {
+                b'w' | b's' => self.vx_hold.press(key),
+                b'a' | b'd' => self.vy_hold.press(key),
+                b'q' | b'e' => self.vyaw_hold.press(key),
+                // X stops outright; there is no hold to keep alive.
+                _ => {}
+            }
         }
 
         match byte {
@@ -101,42 +152,30 @@ impl Keys {
                 self.escape = Some(Escape::Start);
                 self.escape_at = Some(Instant::now());
             }
-            b'w' | b'W' => self.set_vx(VX),
-            b's' | b'S' => self.set_vx(-VX),
-            b'a' | b'A' => self.set_vy(VY),
-            b'd' | b'D' => self.set_vy(-VY),
+            b'w' | b'W' => self.vx = VX_FORWARD,
+            b's' | b'S' => self.vx = -VX_BACKWARD,
+            b'a' | b'A' => self.vy = VY,
+            b'd' | b'D' => self.vy = -VY,
             // Turning on Q/E rather than the arrows, which MuJoCo's viewer uses
             // to step the simulation.
-            b'q' | b'Q' => self.set_vyaw(VYAW),
-            b'e' | b'E' => self.set_vyaw(-VYAW),
+            b'q' | b'Q' => self.vyaw = VYAW,
+            b'e' | b'E' => self.vyaw = -VYAW,
             b'x' | b'X' => self.stop(),
             0x03 => self.quit = true,
             _ => {}
         }
     }
 
-    fn set_vx(&mut self, value: f32) {
-        self.vx = value;
-    }
-
-    fn set_vy(&mut self, value: f32) {
-        self.vy = value;
-    }
-
-    fn set_vyaw(&mut self, value: f32) {
-        self.vyaw = value;
-    }
-
     fn stop(&mut self) {
         self.vx = 0.0;
         self.vy = 0.0;
         self.vyaw = 0.0;
-        self.last_at = None;
-        self.last_key = None;
-        self.repeating = false;
+        self.vx_hold = Hold::default();
+        self.vy_hold = Hold::default();
+        self.vyaw_hold = Hold::default();
     }
 
-    /// The command for this tick, zeroed once the held key stops repeating.
+    /// The command for this tick, each axis zeroed once its own key stops repeating.
     fn command(&mut self) -> [f32; 3] {
         if self.quit {
             return [0.0; 3];
@@ -149,15 +188,14 @@ impl Keys {
             self.escape = None;
             self.escape_at = None;
         }
-        if let Some(at) = self.last_at {
-            let timeout = if self.repeating {
-                HOLD_REPEAT
-            } else {
-                HOLD_START
-            };
-            if at.elapsed() > timeout {
-                self.stop();
-            }
+        if !self.vx_hold.held() {
+            self.vx = 0.0;
+        }
+        if !self.vy_hold.held() {
+            self.vy = 0.0;
+        }
+        if !self.vyaw_hold.held() {
+            self.vyaw = 0.0;
         }
         [self.vx, self.vy, self.vyaw]
     }
@@ -307,7 +345,7 @@ fn main() -> Result<()> {
                 raw.claim_terminal();
                 spawn_reader(tty.try_clone()?, Arc::clone(&keys));
                 eprintln!(
-                    "dora-keyboard: hold W/S vx={VX}, A/D vy={VY}, Q/E turn={VYAW}; release stops; X stop; Ctrl-C ends"
+                    "dora-keyboard: hold W vx={VX_FORWARD} / S vx=-{VX_BACKWARD}, A/D vy={VY}, Q/E turn={VYAW}; release stops; X stop; Ctrl-C ends"
                 );
                 Some(raw)
             }
@@ -383,8 +421,8 @@ mod tests {
 
     #[test]
     fn wasd_sets_each_axis() {
-        assert_eq!(keys(b"w").command(), [VX, 0.0, 0.0]);
-        assert_eq!(keys(b"s").command(), [-VX, 0.0, 0.0]);
+        assert_eq!(keys(b"w").command(), [VX_FORWARD, 0.0, 0.0]);
+        assert_eq!(keys(b"s").command(), [-VX_BACKWARD, 0.0, 0.0]);
         assert_eq!(keys(b"a").command()[1], VY);
         assert_eq!(keys(b"d").command()[1], -VY);
     }
@@ -419,7 +457,9 @@ mod tests {
             }
         }
         assert_eq!(keys.command(), [0.0; 3]);
-        assert_eq!(keys.last_key, None);
+        assert!(keys.vx_hold.key.is_none());
+        assert!(keys.vy_hold.key.is_none());
+        assert!(keys.vyaw_hold.key.is_none());
     }
 
     #[test]
@@ -444,28 +484,65 @@ mod tests {
         keys.escape_at = Some(Instant::now() - ESCAPE_TIMEOUT - Duration::from_millis(1));
         let _ = keys.command();
         keys.apply(b'w');
-        assert_eq!(keys.command(), [VX, 0.0, 0.0]);
+        assert_eq!(keys.command(), [VX_FORWARD, 0.0, 0.0]);
     }
 
     #[test]
     fn first_press_survives_the_initial_repeat_delay() {
         let mut keys = keys(b"w");
-        keys.last_at = Some(Instant::now() - Duration::from_millis(700));
-        assert_eq!(keys.command(), [VX, 0.0, 0.0]);
+        keys.vx_hold.last_at = Some(Instant::now() - Duration::from_millis(700));
+        assert_eq!(keys.command(), [VX_FORWARD, 0.0, 0.0]);
     }
 
     #[test]
     fn release_stops_after_repeats() {
         let mut keys = keys(b"ww");
-        keys.last_at = Some(Instant::now() - HOLD_REPEAT - Duration::from_millis(1));
+        keys.vx_hold.last_at = Some(Instant::now() - HOLD_REPEAT - Duration::from_millis(1));
         assert_eq!(keys.command(), [0.0; 3]);
     }
 
     #[test]
     fn tap_stops_after_the_initial_window() {
         let mut keys = keys(b"w");
-        keys.last_at = Some(Instant::now() - HOLD_START - Duration::from_millis(1));
+        keys.vx_hold.last_at = Some(Instant::now() - HOLD_START - Duration::from_millis(1));
         assert_eq!(keys.command(), [0.0; 3]);
+    }
+
+    /// Releasing W and holding A must stop the forward axis once W's own repeats
+    /// stop, even though A keeps repeating. A shared timer used to refresh on A's
+    /// repeats and leave `vx` latched for as long as A was held.
+    #[test]
+    fn a_held_axis_does_not_keep_the_previous_axis_alive() {
+        let mut keys = keys(b"wwa");
+        assert_eq!(keys.command(), [VX_FORWARD, VY, 0.0]);
+
+        // W's last repeat is now older than its release window; A's is current.
+        keys.vx_hold.last_at = Some(Instant::now() - HOLD_REPEAT - Duration::from_millis(1));
+        assert_eq!(keys.command(), [0.0, VY, 0.0]);
+    }
+
+    /// A second press of the same key after it has stopped repeating is a new
+    /// press and gets the long initial window again.
+    #[test]
+    fn pressing_a_key_again_after_release_starts_a_new_press() {
+        let mut keys = keys(b"ww");
+        keys.vx_hold.last_at = Some(Instant::now() - HOLD_REPEAT - Duration::from_millis(1));
+        assert_eq!(keys.command(), [0.0; 3]);
+
+        keys.apply(b'w');
+        assert!(!keys.vx_hold.repeating, "a new press is not a repeat");
+        keys.vx_hold.last_at = Some(Instant::now() - Duration::from_millis(700));
+        assert_eq!(keys.command(), [VX_FORWARD, 0.0, 0.0]);
+    }
+
+    /// Two keys on different axes held together keep both axes alive, each on its
+    /// own repeats — the case the per-axis timers must not break.
+    #[test]
+    fn a_chord_holds_both_axes() {
+        let mut keys = keys(b"wqwq");
+        keys.vx_hold.last_at = Some(Instant::now() - Duration::from_millis(10));
+        keys.vyaw_hold.last_at = Some(Instant::now() - Duration::from_millis(10));
+        assert_eq!(keys.command(), [VX_FORWARD, 0.0, VYAW]);
     }
 
     #[test]
