@@ -106,6 +106,8 @@ dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-w
 
 不再使用方向键和空格：MuJoCo viewer 用它们做单步和暂停。方向键序列会被键盘节点整体吞掉（`ESC [ D` 的 `D` 不会误触发右平移）。驱动时让终端保持焦点；viewer 不需要焦点也能渲染。Ctrl-C 第一次退出键盘节点并恢复终端，再按一次才会停掉整个数据流。
 
+启动时节点会打印 `/dev/tty ready (pgrp X, foreground Y)`。如果两个值不同，说明 dora 把它放进了后台进程组，它会自动接管终端前台（`took the terminal's foreground group`），退出时再还回去。按下任意键后出现 `first key received` 表示输入通路正常；没有这一行，说明按键去了别的窗口（通常是 MuJoCo viewer），点一下终端再试。
+
 终端没有 key-release 事件，节点用按键重复判断“按住”：400 ms 内没有新按键就发布零，所以松开即停。默认 vx 取 0.30，是因为这套 MuJoCo 模型在 0.25 m/s 以下基本不走（实测 0.20 三秒只移动 1 mm）。
 
 要真正驱动 robotd：

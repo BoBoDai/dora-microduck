@@ -109,6 +109,8 @@ impl Keys {
 struct RawMode {
     fd: RawFd,
     original: libc::termios,
+    /// Foreground group before this node claimed it, when it had to.
+    original_foreground: Option<libc::pid_t>,
 }
 
 impl RawMode {
@@ -131,12 +133,45 @@ impl RawMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd, original })
+        Ok(Self {
+            fd,
+            original,
+            original_foreground: None,
+        })
+    }
+
+    /// dora spawns nodes from its daemon, and the node can land in a background
+    /// process group: the tty opens and goes raw, but the first read fails with
+    /// EIO. Take the foreground here, and give it back on drop so the second
+    /// Ctrl-C still reaches dora.
+    fn claim_terminal(&mut self) {
+        let pgrp = unsafe { libc::getpgrp() };
+        let foreground = unsafe { libc::tcgetpgrp(self.fd) };
+        eprintln!("dora-keyboard: /dev/tty ready (pgrp {pgrp}, foreground {foreground})");
+        if foreground < 0 || foreground == pgrp {
+            return;
+        }
+        if unsafe { libc::tcsetpgrp(self.fd, pgrp) } == 0 {
+            self.original_foreground = Some(foreground);
+            eprintln!(
+                "dora-keyboard: took the terminal's foreground group ({foreground} -> {pgrp})"
+            );
+        } else {
+            eprintln!(
+                "dora-keyboard: cannot take the terminal's foreground: {}",
+                io::Error::last_os_error()
+            );
+        }
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        if let Some(foreground) = self.original_foreground.take() {
+            unsafe {
+                libc::tcsetpgrp(self.fd, foreground);
+            }
+        }
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
@@ -146,9 +181,14 @@ impl Drop for RawMode {
 fn spawn_reader(mut tty: File, keys: Arc<Mutex<Keys>>) {
     std::thread::spawn(move || {
         let mut byte = [0u8; 1];
+        let mut first = true;
         loop {
             match tty.read(&mut byte) {
                 Ok(1) => {
+                    if first {
+                        first = false;
+                        eprintln!("dora-keyboard: first key received");
+                    }
                     let mut keys = keys.lock().expect("keyboard state poisoned");
                     keys.apply(byte[0]);
                     if keys.quit {
@@ -157,7 +197,10 @@ fn spawn_reader(mut tty: File, keys: Arc<Mutex<Keys>>) {
                 }
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
+                Err(err) => {
+                    eprintln!("dora-keyboard: tty read stopped: {err}");
+                    break;
+                }
             }
         }
     });
@@ -169,7 +212,8 @@ fn main() -> Result<()> {
 
     let raw_mode = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
         Ok(tty) => match RawMode::enable(tty.as_raw_fd()) {
-            Ok(raw) => {
+            Ok(mut raw) => {
+                raw.claim_terminal();
                 spawn_reader(tty.try_clone()?, Arc::clone(&keys));
                 eprintln!(
                     "dora-keyboard: W/S vx={VX}, A/D vy={VY}, Q/E turn={VYAW}, X stop, Ctrl-C quit"
