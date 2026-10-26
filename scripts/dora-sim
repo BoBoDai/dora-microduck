@@ -1,0 +1,172 @@
+#!/bin/sh
+# One command for the whole twin: the upstream MuJoCo simulator plus the dora
+# dataflow, with the keyboard node pointed at the simulated duck.
+#
+#   scripts/dora-sim                 # start the twin, run the dataflow, stop it
+#   scripts/dora-sim run --stop-after 5
+#   scripts/dora-sim up              # start the twin and leave it
+#   scripts/dora-sim status          # health + loop rate
+#   scripts/dora-sim drive 0.3       # walk forward for 8 s
+#   scripts/dora-sim ctl health      # anything robotctl does
+#   scripts/dora-sim down            # stop the twin
+#
+# `dora run` must stay in the foreground: the keyboard node reads /dev/tty, and
+# dora gives nodes a null stdin.
+#
+# The MuJoCo body is extracted from microduck_rl into target/duck-sim/rl so
+# everything runs under this project and the other checkout is never modified.
+# Override with MICRODUCK_RL (a checkout) and MICRODUCK_RL_REF (default
+# origin/develop), or DUCK_SIM_DUCK for a duck other than duck-a.
+set -eu
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MICRODUCK="$ROOT/vendor/microduck"
+SIM_ROOT="$ROOT/target/duck-sim"
+RL="$SIM_ROOT/rl"
+STATE="$SIM_ROOT/state"
+DUCK="${DUCK_SIM_DUCK:-duck-a}"
+SOCK="$STATE/$DUCK.sock"
+SIM="$MICRODUCK/scripts/duck-sim"
+
+STARTED=0
+
+say() { printf '\033[36m==\033[0m %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+}
+
+run_sim() {
+    (
+        cd "$MICRODUCK"
+        DUCK_SIM_RL="$RL" PYTHONPATH="$RL/src" DUCK_SIM_STATE="$STATE" \
+            "$SIM" "$@"
+    )
+}
+
+# The body server lives in microduck_rl, not in the microduck submodule. Pull
+# the few files it needs into the project's target dir instead of checking out
+# or modifying that repository.
+prepare_rl() {
+    if [ -f "$RL/src/mjlab_microduck/sim/body_server.py" ] && [ -x "$RL/.venv/bin/python" ]; then
+        return 0
+    fi
+
+    rl_src="${MICRODUCK_RL:-}"
+    if [ -z "$rl_src" ]; then
+        for candidate in "$HOME/projects/microduck_rl" "$HOME/Pollen/microduck_rl"; do
+            if [ -d "$candidate/.git" ]; then
+                rl_src="$candidate"
+                break
+            fi
+        done
+    fi
+    [ -n "$rl_src" ] || die "no microduck_rl checkout; set MICRODUCK_RL=/path/to/microduck_rl"
+
+    ref="${MICRODUCK_RL_REF:-origin/develop}"
+    git -C "$rl_src" rev-parse --verify --quiet "$ref" >/dev/null ||
+        die "$rl_src has no $ref; run: git -C $rl_src fetch origin"
+    [ -x "$rl_src/.venv/bin/python" ] ||
+        die "$rl_src has no .venv; run: (cd $rl_src && uv sync)"
+
+    say "extracting the simulator from $rl_src ($ref)"
+    mkdir -p "$RL"
+    git -C "$rl_src" archive "$ref" \
+        src/mjlab_microduck/__init__.py \
+        src/mjlab_microduck/sim \
+        src/mjlab_microduck/robot/microduck |
+        tar -x -C "$RL"
+    ln -sfn "$rl_src/.venv" "$RL/.venv"
+}
+
+is_up() {
+    [ -S "$SOCK" ] || return 1
+    run_sim status 2>/dev/null | grep -q 'healthy'
+}
+
+start_sim() {
+    prepare_rl
+    say "starting the MuJoCo twin (state: $STATE)"
+    run_sim || die "duck-sim failed; see $STATE/body.log"
+}
+
+cleanup() {
+    if [ "$STARTED" = 1 ]; then
+        say "stopping the MuJoCo twin"
+        run_sim down >/dev/null 2>&1 || true
+        STARTED=0
+    fi
+}
+trap cleanup EXIT
+
+cmd_run() {
+    command -v cargo >/dev/null || die "cargo not found"
+    command -v dora >/dev/null || die "dora CLI not found; cargo install dora-cli --version 1.1.0"
+
+    say "building the dora nodes"
+    ( cd "$ROOT" && cargo build --quiet -p dora-keyboard -p dora-robotd-wrapper -p dora-mujoco-bridge )
+
+    if is_up; then
+        say "using the running twin at $SOCK"
+    else
+        start_sim
+        STARTED=1
+    fi
+
+    say "keyboard: W/S vx, A/D vy, arrows turn, space stop, q quits the keyboard node"
+    say "Ctrl-C stops the dataflow; this script then takes the twin down"
+    ROBOTD_SOCKET="$SOCK" dora run "$ROOT/dataflows/sim.yml" "$@"
+}
+
+case "${1:-run}" in
+    run)
+        shift
+        cmd_run "$@"
+        ;;
+    help | -h | --help)
+        usage
+        ;;
+    -*) cmd_run "$@" ;;
+    up)
+        shift
+        if is_up; then
+            say "already up at $SOCK"
+        else
+            start_sim
+        fi
+        run_sim status
+        ;;
+    status)
+        shift
+        run_sim status "$@"
+        ;;
+    realtime)
+        shift
+        run_sim realtime "$@"
+        ;;
+    drive)
+        shift
+        run_sim drive "$@"
+        ;;
+    ctl)
+        shift
+        run_sim ctl "$@"
+        ;;
+    log | simlog | monitor | stand)
+        sub="$1"
+        shift
+        run_sim "$sub" "$@"
+        ;;
+    down)
+        shift
+        run_sim down "$@"
+        ;;
+    sim)
+        shift
+        run_sim "$@"
+        ;;
+    *)
+        die "unknown command '$1' (try: run, up, status, drive, ctl, log, realtime, down)"
+        ;;
+esac

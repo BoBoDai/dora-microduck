@@ -30,7 +30,12 @@ cargo build --workspace
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Build before running: dataflows/sim.yml points at target/debug/<bin>.
+# One command: start the MuJoCo twin, run the dataflow, stop the twin.
+scripts/dora-sim
+scripts/dora-sim run --stop-after 5
+scripts/dora-sim up | status | drive 0.3 | ctl health | down
+
+# Dataflow only (the twin must already be running for cmd_vel to reach robotd).
 dora run dataflows/sim.yml
 dora run dataflows/sim.yml --stop-after 10   # 1.1.0 accepts bare seconds
 
@@ -40,8 +45,9 @@ dora graph dataflows/sim.yml --mermaid
 
 - `dora run` starts an isolated local daemon and exits once the dataflow stops; `dora up` is not needed.
 - Per-run logs and the session file land in `dataflows/out/`, which is gitignored.
-- There is **no test suite yet**. `cargo test --workspace` is the command once tests exist; target one crate with `cargo test -p dora-robotd-wrapper`.
-- `dora run dataflows/sim.yml --stop-after 4` is the quick end-to-end smoke test: expect "stepped N times over 15 joints" and "forwarded N joint states (15 joints each)" lines, then both nodes finishing successfully.
+- `cargo test --workspace` runs the keyboard parser tests; target one crate with `cargo test -p dora-keyboard`.
+- `dora run dataflows/sim.yml --stop-after 4` is the quick end-to-end smoke test: expect "stepped N times over 15 joints" and "forwarded N joint states (15 joints each)", then all three nodes finishing successfully. Without a controlling terminal the keyboard node logs "keyboard disabled" and publishes zeros; that is the expected non-interactive result.
+- `scripts/dora-sim run` is the end-to-end launcher test: it should print "standing", connect the wrapper to `target/duck-sim/state/duck-a.sock`, run the dataflow, then "stopping the MuJoCo twin" with no leftover processes.
 
 ## Architecture
 
@@ -54,14 +60,17 @@ dora graph dataflows/sim.yml --mermaid
 
 ### Nodes
 
+- `crates/dora-keyboard` — reads held keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. A terminal cannot report key release, so a key counts as held for 400 ms after its last repeat. Defaults are 0.30 / 0.15 / 0.50; 0.30 is above the ~0.25 m/s deadband the MuJoCo twin shows. Without a tty it warns and publishes zeros.
 - `crates/dora-mujoco-bridge` — owns the clock (`dora/timer/millis/10`), advances the simulation, publishes `joint_state`. Currently a deterministic synthetic gait; the MuJoCo binding is still a TODO.
-- `crates/dora-robotd-wrapper` — consumes `joint_state`, validates the length against `duck_ipc_proto::JOINT_NAMES` (15 joints), publishes `joint_command`. Currently mirrors the state; the actual robotd IPC link is a TODO.
+- `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It also consumes `joint_state`, validates the length against `duck_ipc_proto::JOINT_NAMES` (15 joints), and publishes `joint_command`; that mirror is the stub for the real state stream.
 
 ### Dataflow
 
-`dataflows/sim.yml` forms a feedback loop:
+`dataflows/sim.yml` forms a feedback loop, with the keyboard feeding the wrapper:
 
 ```
+keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd (ROBOTD_SOCKET)
+
 dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-wrapper
                               ▲                              │
                               └──────── joint_command ───────┘
@@ -70,6 +79,18 @@ dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-w
 - `path:` in the YAML is resolved **relative to the dataflow file's directory**, hence `../target/debug/<bin>`.
 - dora supports this cycle (verified); it is message-passing, not a topological DAG restriction.
 - Payloads are **Arrow arrays of `f32`** via `IntoArrow` / `TryFrom<&ArrowData>`, not JSON. Joint count and order must come from `duck_ipc_proto::JOINT_NAMES`.
+- The keyboard node needs a controlling terminal; `dora run` from a non-tty (CI, an agent shell) only exercises the zero-command path.
+
+### Simulation launcher (A1)
+
+`scripts/dora-sim` is deliberately **outside** the dataflow:
+
+1. It extracts the MuJoCo body from `microduck_rl` (`origin/develop`, overridable with `MICRODUCK_RL_REF`) into `target/duck-sim/rl`, symlinks that checkout's `.venv`, and never modifies the other repository. Override the source checkout with `MICRODUCK_RL`.
+2. It starts the upstream `vendor/microduck/scripts/duck-sim`, which owns daemon build, policy fetch, params, sockets, health checks and standing.
+3. It exports `ROBOTD_SOCKET` and runs `dora run` in the foreground.
+4. On exit it runs `duck-sim down` **only if it started the twin**; an already-running twin is left alone.
+
+Do **not** turn the upstream daemons into dora nodes. `robotd` is binary-only and safety-critical; `btd`/`configd`/`updaterd` must survive a dead `robotd` and depend on systemd units and socket permissions. Dora owns the graph; systemd/upstream owns the daemons. The one seam worth taking over later is the MuJoCo body protocol from `duck_control::sim` (`hello/read/write/gain/torque/slow`, protocol 1).
 
 ### Dependency constraints
 

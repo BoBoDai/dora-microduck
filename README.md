@@ -12,9 +12,12 @@
 ├── Cargo.lock                  # workspace 级锁文件，提交
 ├── crates/
 │   ├── dora-robotd-wrapper/    # 把 robotd 接入 dora 图的节点
+│   ├── dora-keyboard/          # 终端键盘 → cmd_vel 节点
 │   └── dora-mujoco-bridge/     # MuJoCo 仿真节点
 ├── dataflows/
 │   └── sim.yml                 # 仿真数据流定义
+├── scripts/
+│   └── dora-sim                # 一键启动：MuJoCo twin + dora 数据流
 ├── vendor/
 │   └── microduck/              # git submodule（上游仓库，不随本仓库提交）
 └── README.md
@@ -51,7 +54,24 @@ git submodule update --init --recursive
 
 子模块未初始化时，`crates/*` 对 `vendor/microduck/duck-ipc-proto` 的 path 依赖会导致 cargo 直接报错（而不是一条友好的缺依赖提示）。
 
-## 构建与运行
+## 一键启动仿真
+
+```bash
+scripts/dora-sim                  # 启动 twin → 跑 dora 数据流 → 退出时关闭 twin
+scripts/dora-sim run --stop-after 5
+scripts/dora-sim up               # 只启动 twin，保持运行
+scripts/dora-sim status           # health / 50 Hz / standing
+scripts/dora-sim drive 0.3        # 向前走 8 秒
+scripts/dora-sim ctl health       # 任意 robotctl 命令
+scripts/dora-sim down             # 关闭 twin
+```
+
+- `run` 必须在前台终端执行：键盘节点读 `/dev/tty`，dora 给节点的 stdin 是 null
+- 脚本会自动设置 `ROBOTD_SOCKET=target/duck-sim/state/duck-a.sock`，`cmd_vel` 直接进模拟的 robotd
+- MuJoCo body 从 `microduck_rl` 的 `origin/develop` 提取到 `target/duck-sim/rl`（不修改那个仓库）；可用 `MICRODUCK_RL`、`MICRODUCK_RL_REF`、`DUCK_SIM_DUCK` 覆盖
+- 如果 twin 已经在运行，`run` 会复用它，退出时也不会关掉它；只有本次启动的才会在退出时 `down`
+
+## 手动分步运行
 
 ```bash
 cargo build
@@ -63,18 +83,43 @@ dora run dataflows/sim.yml
 数据流拓扑：
 
 ```
+keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd（设置 ROBOTD_SOCKET 时）
+
 dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-wrapper
                               ▲                              │
                               └──────── joint_command ───────┘
 ```
 
-两节点构成反馈环：仿真节点发布关节状态，wrapper 返回 robotd 会下发的指令。
+`mujoco-bridge` 和 `robotd-wrapper` 构成反馈环：仿真节点发布关节状态，wrapper 返回 robotd 会下发的指令。`keyboard` 节点的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 `ROBOTD_SOCKET` 时只打印日志。
+
+## 键盘遥操作
+
+`dora run` 要在终端里执行：dora 给节点的 stdin 是 null，`keyboard` 节点直接读 `/dev/tty`。没有控制终端时它打印警告并发布零，不会让数据流失败。
+
+| 键 | 效果 |
+|---|---|
+| W / S | vx = +0.30 / -0.30 m/s |
+| A / D | vy = +0.15 / -0.15 m/s |
+| ← / → | vyaw = +0.50 / -0.50 rad/s |
+| ↑ / ↓ | 同 W / S |
+| 空格 | 全部归零 |
+| Q / Ctrl-C | 退出节点并恢复终端 |
+
+终端没有 key-release 事件，节点用按键重复判断“按住”：400 ms 内没有新按键就发布零，所以松开即停。默认 vx 取 0.30，是因为这套 MuJoCo 模型在 0.25 m/s 以下基本不走（实测 0.20 三秒只移动 1 mm）。
+
+要真正驱动 robotd：
+
+```bash
+export ROBOTD_SOCKET=/path/to/duck-a.sock
+dora run dataflows/sim.yml
+```
 
 ## 当前状态
 
-这是骨架，两个节点都能构建、能跑通数据流，但关键的下游连接尚未接入：
+这是骨架，三个节点都能构建、能跑通数据流，但关键的下游连接还在补：
 
-- `dora-robotd-wrapper`：还没有真正连接 robotd 的 IPC socket，目前把收到的关节状态原样回传（见 `src/main.rs` 中的 `TODO`）。后续使用 `duck_ipc_proto` 里的请求/响应类型实现。
+- `dora-keyboard`：终端键盘已经可用（`/dev/tty` + termios raw mode）。
+- `dora-robotd-wrapper`：`cmd_vel` 已经能转成 `robot.move` 发到 `ROBOTD_SOCKET`；`joint_state` 仍然是原样回传的占位实现（见 `src/main.rs` 中的 `TODO`），尚未订阅 robotd 的真实状态流。
 - `dora-mujoco-bridge`：还没有引入 MuJoCo 绑定，目前用一个确定性的合成步态代替仿真。
 
 ## 关于 Cargo.lock
