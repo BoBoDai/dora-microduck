@@ -40,10 +40,10 @@ cargo install dora-cli --version 1.1.0 --locked
 
 ## 初始化
 
-克隆时一并拉取子模块：
+克隆时一并拉取子模块（普通 `git clone` 不会拉，`vendor/microduck` 会是空目录）：
 
 ```bash
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules git@github.com:BoBoDai/dora-microduck.git
 ```
 
 已经克隆过的话：
