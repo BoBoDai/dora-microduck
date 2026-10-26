@@ -1,9 +1,11 @@
 //! Terminal teleoperation as a dora node.
 //!
 //! dora gives nodes a null stdin, so keys are read from `/dev/tty`. Every timer
-//! tick publishes `cmd_vel` as `[vx, vy, vyaw]`. A terminal cannot report key
-//! release, so a key counts as held for as long as it repeats; 400 ms without a
-//! recognised key publishes zero, which stops the duck on release.
+//! tick publishes `cmd_vel` as `[vx, vy, vyaw]`. Hold to move, release to stop:
+//! terminals report no key-up, so a key counts as held while the terminal keeps
+//! repeating it. The OS delays the first repeat, so the first window is longer;
+//! once repeats are flowing the timeout is short and release stops promptly.
+//! X stops immediately, and Ctrl-C stops the whole dataflow.
 //!
 //! Run the dataflow from a terminal: without a controlling terminal the node
 //! logs a warning and publishes zeros instead of failing.
@@ -17,8 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CMD_VEL: &str = "cmd_vel";
-/// Longer than a key repeat gap, short enough to stop promptly on release.
-const HOLD: Duration = Duration::from_millis(400);
+/// Covers the OS's initial key-repeat delay, before the first repeat arrives.
+const HOLD_START: Duration = Duration::from_millis(800);
+/// Once repeats are flowing, this is the release timeout.
+const HOLD_REPEAT: Duration = Duration::from_millis(250);
 /// Above the ~0.25 m/s deadband the MuJoCo twin shows at low commands.
 const VX: f32 = 0.30;
 const VY: f32 = 0.15;
@@ -29,8 +33,12 @@ struct Keys {
     vx: f32,
     vy: f32,
     vyaw: f32,
-    last: Option<Instant>,
     quit: bool,
+    /// Last recognised key, lower-cased; a repeat is the same byte again.
+    last_key: Option<u8>,
+    last_at: Option<Instant>,
+    /// Whether a repeat has arrived for the current press.
+    repeating: bool,
     /// 0 = idle, 1 = saw ESC, 2 = saw `ESC [`.
     escape: u8,
 }
@@ -47,6 +55,15 @@ impl Keys {
             // `ESC [ D` (left arrow) would read as a strafe.
             self.escape = 0;
             return;
+        }
+
+        if let Some(key) = recognised(byte) {
+            let repeat = self.last_key == Some(key);
+            self.last_key = Some(key);
+            self.last_at = Some(Instant::now());
+            // A different key starts a new press: give it the long initial
+            // window until its own repeats begin.
+            self.repeating = repeat;
         }
 
         match byte {
@@ -67,40 +84,57 @@ impl Keys {
 
     fn set_vx(&mut self, value: f32) {
         self.vx = value;
-        self.touch();
     }
 
     fn set_vy(&mut self, value: f32) {
         self.vy = value;
-        self.touch();
     }
 
     fn set_vyaw(&mut self, value: f32) {
         self.vyaw = value;
-        self.touch();
-    }
-
-    fn touch(&mut self) {
-        self.last = Some(Instant::now());
     }
 
     fn stop(&mut self) {
         self.vx = 0.0;
         self.vy = 0.0;
         self.vyaw = 0.0;
-        self.last = None;
+        self.last_at = None;
+        self.last_key = None;
+        self.repeating = false;
     }
 
-    /// The command for this tick, zeroed once the last key has gone stale.
+    /// The command for this tick, zeroed once the held key stops repeating.
     fn command(&mut self) -> [f32; 3] {
         if self.quit {
             return [0.0; 3];
         }
-        let held = self.last.is_some_and(|at| at.elapsed() < HOLD);
-        if !held {
-            self.stop();
+        if let Some(at) = self.last_at {
+            let timeout = if self.repeating {
+                HOLD_REPEAT
+            } else {
+                HOLD_START
+            };
+            if at.elapsed() > timeout {
+                self.stop();
+            }
         }
         [self.vx, self.vy, self.vyaw]
+    }
+}
+
+/// The key a byte drives, lower-cased, for repeat detection. Unrecognised bytes
+/// (including escape-sequence finals) return `None`, so they cannot keep a
+/// command alive.
+fn recognised(byte: u8) -> Option<u8> {
+    match byte {
+        b'w' | b'W' => Some(b'w'),
+        b's' | b'S' => Some(b's'),
+        b'a' | b'A' => Some(b'a'),
+        b'd' | b'D' => Some(b'd'),
+        b'q' | b'Q' => Some(b'q'),
+        b'e' | b'E' => Some(b'e'),
+        b'x' | b'X' => Some(b'x'),
+        _ => None,
     }
 }
 
@@ -223,7 +257,7 @@ fn main() -> Result<()> {
                 raw.claim_terminal();
                 spawn_reader(tty.try_clone()?, Arc::clone(&keys));
                 eprintln!(
-                    "dora-keyboard: W/S vx={VX}, A/D vy={VY}, Q/E turn={VYAW}, X stop, Ctrl-C quit"
+                    "dora-keyboard: hold W/S vx={VX}, A/D vy={VY}, Q/E turn={VYAW}; release stops; X stop; Ctrl-C ends"
                 );
                 Some(raw)
             }
@@ -325,9 +359,23 @@ mod tests {
     }
 
     #[test]
-    fn stale_key_zeroes() {
+    fn first_press_survives_the_initial_repeat_delay() {
         let mut keys = keys(b"w");
-        keys.last = Some(Instant::now() - HOLD - Duration::from_millis(1));
+        keys.last_at = Some(Instant::now() - Duration::from_millis(700));
+        assert_eq!(keys.command(), [VX, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn release_stops_after_repeats() {
+        let mut keys = keys(b"ww");
+        keys.last_at = Some(Instant::now() - HOLD_REPEAT - Duration::from_millis(1));
+        assert_eq!(keys.command(), [0.0; 3]);
+    }
+
+    #[test]
+    fn tap_stops_after_the_initial_window() {
+        let mut keys = keys(b"w");
+        keys.last_at = Some(Instant::now() - HOLD_START - Duration::from_millis(1));
         assert_eq!(keys.command(), [0.0; 3]);
     }
 
