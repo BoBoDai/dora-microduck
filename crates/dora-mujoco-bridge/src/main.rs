@@ -4,7 +4,7 @@
 //! synthetic gait over the joints in `duck_ipc_proto::JOINT_NAMES` so the
 //! dataflow can be exercised before the simulator is wired in.
 
-use dora_node_api::{dora_core::config::DataId, DoraNode, Event, IntoArrow};
+use dora_node_api::{DoraNode, Event, IntoArrow, dora_core::config::DataId};
 use eyre::Result;
 use std::f32::consts::TAU;
 

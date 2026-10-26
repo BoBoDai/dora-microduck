@@ -915,6 +915,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-keyboard"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "eyre",
+ "libc",
+]
+
+[[package]]
 name = "dora-message"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

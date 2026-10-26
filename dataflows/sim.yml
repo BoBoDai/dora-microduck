@@ -1,12 +1,15 @@
 # Simulation loop for the duck.
 #
 #   cargo build
-#   dora up
 #   dora run dataflows/sim.yml
 #
 # Paths are resolved relative to this file, hence the `../target/...` prefix.
 # The two nodes form a feedback loop: the bridge publishes measured joint state,
 # the wrapper answers with the command robotd would apply.
+#
+# `keyboard` reads the terminal (not stdin — dora gives nodes a null stdin) and
+# publishes cmd_vel at 20 Hz. Export ROBOTD_SOCKET to forward those commands to
+# a running robotd; without it they are only logged.
 nodes:
   - id: mujoco-bridge
     path: ../target/debug/dora-mujoco-bridge
@@ -16,9 +19,17 @@ nodes:
     outputs:
       - joint_state
 
+  - id: keyboard
+    path: ../target/debug/dora-keyboard
+    inputs:
+      tick: dora/timer/millis/50
+    outputs:
+      - cmd_vel
+
   - id: robotd-wrapper
     path: ../target/debug/dora-robotd-wrapper
     inputs:
       joint_state: mujoco-bridge/joint_state
+      cmd_vel: keyboard/cmd_vel
     outputs:
       - joint_command
