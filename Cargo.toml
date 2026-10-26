@@ -1,0 +1,24 @@
+# Workspace root for the dora dataflow that drives Microduck.
+#
+# `vendor/microduck` is a git submodule with its own workspace; it is excluded
+# so cargo never treats its crates as members here. The dataflow crates pull the
+# few submodule crates they need as path dependencies (see `[workspace.dependencies]`).
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["vendor/microduck"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# dora 1.1.0 declares rustc 1.95 as its MSRV, so that is this workspace's floor.
+rust-version = "1.95"
+
+[workspace.dependencies]
+# Keep in step with the installed dora CLI: the node API and the daemon must
+# speak the same protocol.
+dora-node-api = "1.1.0"
+duck-ipc-proto = { path = "vendor/microduck/duck-ipc-proto" }
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

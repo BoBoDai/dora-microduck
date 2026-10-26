@@ -1,0 +1,24 @@
+# Simulation loop for the duck.
+#
+#   cargo build
+#   dora up
+#   dora run dataflows/sim.yml
+#
+# Paths are resolved relative to this file, hence the `../target/...` prefix.
+# The two nodes form a feedback loop: the bridge publishes measured joint state,
+# the wrapper answers with the command robotd would apply.
+nodes:
+  - id: mujoco-bridge
+    path: ../target/debug/dora-mujoco-bridge
+    inputs:
+      tick: dora/timer/millis/10
+      joint_command: robotd-wrapper/joint_command
+    outputs:
+      - joint_state
+
+  - id: robotd-wrapper
+    path: ../target/debug/dora-robotd-wrapper
+    inputs:
+      joint_state: mujoco-bridge/joint_state
+    outputs:
+      - joint_command

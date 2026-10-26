@@ -1,0 +1,3 @@
+[submodule "vendor/microduck"]
+	path = vendor/microduck
+	url = https://github.com/pollen-robotics/microduck.git

@@ -1,0 +1,6 @@
+# dora 1.1.0 requires rustc 1.95; the repo-wide default on some machines is an
+# older nightly. Pin this project to stable so `cargo build` here is unambiguous.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
