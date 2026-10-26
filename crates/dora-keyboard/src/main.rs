@@ -42,15 +42,10 @@ impl Keys {
             return;
         }
         if self.escape == 2 {
+            // Swallow the final byte of an escape sequence. Arrow keys and
+            // function keys end in letters that mean something here otherwise —
+            // `ESC [ D` (left arrow) would read as a strafe.
             self.escape = 0;
-            match byte {
-                b'A' => self.set_vx(VX),
-                b'B' => self.set_vx(-VX),
-                // Arrow keys: left turns left, which `MoveParams` spells positive.
-                b'C' => self.set_vyaw(-VYAW),
-                b'D' => self.set_vyaw(VYAW),
-                _ => {}
-            }
             return;
         }
 
@@ -60,8 +55,12 @@ impl Keys {
             b's' | b'S' => self.set_vx(-VX),
             b'a' | b'A' => self.set_vy(VY),
             b'd' | b'D' => self.set_vy(-VY),
-            b' ' => self.stop(),
-            b'q' | b'Q' | 0x03 => self.quit = true,
+            // Turning on Q/E rather than the arrows, which MuJoCo's viewer uses
+            // to step the simulation.
+            b'q' | b'Q' => self.set_vyaw(VYAW),
+            b'e' | b'E' => self.set_vyaw(-VYAW),
+            b'x' | b'X' => self.stop(),
+            0x03 => self.quit = true,
             _ => {}
         }
     }
@@ -173,7 +172,7 @@ fn main() -> Result<()> {
             Ok(raw) => {
                 spawn_reader(tty.try_clone()?, Arc::clone(&keys));
                 eprintln!(
-                    "dora-keyboard: W/S vx={VX}, A/D vy={VY}, arrows vyaw={VYAW}, space stop, q quit"
+                    "dora-keyboard: W/S vx={VX}, A/D vy={VY}, Q/E turn={VYAW}, X stop, Ctrl-C quit"
                 );
                 Some(raw)
             }
@@ -241,16 +240,22 @@ mod tests {
     }
 
     #[test]
-    fn arrows_steer_and_drive() {
-        assert_eq!(keys(b"\x1b[D").command()[2], VYAW);
-        assert_eq!(keys(b"\x1b[C").command()[2], -VYAW);
-        assert_eq!(keys(b"\x1b[A").command()[0], VX);
-        assert_eq!(keys(b"\x1b[B").command()[0], -VX);
+    fn qe_steers() {
+        assert_eq!(keys(b"q").command()[2], VYAW);
+        assert_eq!(keys(b"e").command()[2], -VYAW);
     }
 
     #[test]
-    fn space_stops() {
-        assert_eq!(keys(b"wa ").command(), [0.0; 3]);
+    fn x_stops() {
+        assert_eq!(keys(b"waqx").command(), [0.0; 3]);
+    }
+
+    #[test]
+    fn arrow_sequences_are_swallowed() {
+        // `ESC [ D` ends in `D`, which would strafe right if the sequence were
+        // not consumed first.
+        let command = keys(b"\x1b[A\x1b[B\x1b[C\x1b[D").command();
+        assert_eq!(command, [0.0; 3]);
     }
 
     #[test]
@@ -261,8 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn q_quits_with_a_zero_command() {
-        let mut keys = keys(b"wq");
+    fn ctrl_c_quits_with_a_zero_command() {
+        let mut keys = keys(b"w\x03");
         assert!(keys.quit);
         assert_eq!(keys.command(), [0.0; 3]);
     }

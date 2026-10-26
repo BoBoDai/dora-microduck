@@ -60,7 +60,7 @@ dora graph dataflows/sim.yml --mermaid
 
 ### Nodes
 
-- `crates/dora-keyboard` — reads held keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. A terminal cannot report key release, so a key counts as held for 400 ms after its last repeat. Defaults are 0.30 / 0.15 / 0.50; 0.30 is above the ~0.25 m/s deadband the MuJoCo twin shows. Without a tty it warns and publishes zeros.
+- `crates/dora-keyboard` — reads held keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. Keys: W/S vx, A/D vy, Q/E yaw, X stop, Ctrl-C quit. Arrow and space sequences are swallowed on purpose — the MuJoCo viewer binds them to stepping and pausing. A terminal cannot report key release, so a key counts as held for 400 ms after its last repeat. Defaults are 0.30 / 0.15 / 0.50; 0.30 is above the ~0.25 m/s deadband the MuJoCo twin shows. Without a tty it warns and publishes zeros.
 - `crates/dora-mujoco-bridge` — owns the clock (`dora/timer/millis/10`), advances the simulation, publishes `joint_state`. Currently a deterministic synthetic gait; the MuJoCo binding is still a TODO.
 - `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It also consumes `joint_state`, validates the length against `duck_ipc_proto::JOINT_NAMES` (15 joints), and publishes `joint_command`; that mirror is the stub for the real state stream.
 
