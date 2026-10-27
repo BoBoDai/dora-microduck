@@ -23,7 +23,8 @@
 │   ├── architecture.md         # 键盘实现、上游架构与 dora 插入点
 │   └── call-graph.md           # 调用关系与调用流程
 ├── scripts/
-│   └── dora-sim                # 一键启动：MuJoCo twin + dora 数据流
+│   ├── dora-sim                # 一键启动：MuJoCo twin + dora 数据流
+│   └── duck-camera-view        # media.frame 相机窗口（Python + OpenCV）
 ├── vendor/
 │   └── microduck/              # git submodule（上游仓库，不随本仓库提交）
 └── README.md
@@ -74,6 +75,7 @@ git submodule update --init --recursive
 scripts/dora-sim                  # 启动 twin → 跑 dora 数据流 → 退出时关闭 twin
 scripts/dora-sim run --stop-after 5
 DUCK_SIM_CAMERAS=a scripts/dora-sim   # 同时启动模拟相机（需要 GStreamer）
+scripts/dora-sim camera           # 打开相机窗口（必要时先启动 twin）
 scripts/dora-sim up               # 只启动 twin，保持运行
 scripts/dora-sim status           # health / 50 Hz / standing
 scripts/dora-sim drive 0.3        # 向前走 8 秒
@@ -86,6 +88,27 @@ scripts/dora-sim down             # 关闭 twin
 - 启用模拟相机时，脚本还会设置 `MEDIA_FRAME_SOCKET=target/duck-sim/state/duck-a-frame.sock`；没启用时 `camera` 节点打印 `camera disabled`，其余图照常运行
 - MuJoCo body 从 `microduck_rl` 的 `origin/develop` 提取到 `target/duck-sim/rl`（不修改那个仓库）；可用 `MICRODUCK_RL`、`MICRODUCK_RL_REF`、`DUCK_SIM_DUCK` 覆盖
 - 如果 twin 已经在运行，`run` 会复用它，退出时也不会关掉它；只有本次启动的才会在退出时 `down`
+
+### 看相机窗口
+
+```bash
+scripts/dora-sim camera
+```
+
+- 打开一个 OpenCV 窗口，显示 `media.frame` 的原始帧，并已按相机安装角（仿真 90°）转正；
+- 如果 twin 没在运行，这条命令会先用当前 `DUCK_SIM_DUCK` 对应的 `DUCK_SIM_CAMERAS` 字母（默认 `a`）启动它；退出时如果 twin 是它启动的，会一并关闭；已经在运行的 twin 不会被动；
+- 关闭窗口、按 `q` 或 Esc 退出；
+- 默认场景是光板地面，窗口里可能只是一片地面/网格；想看房间用
+  `DUCK_SIM_SCENE=apartment scripts/dora-sim camera`；不想同时看到 MuJoCo 仿真窗口就加
+  `DUCK_SIM_VIEWER=0`；
+- 相机是 90° 侧装的，转正后画面是 360×640 竖屏，所以窗口是竖条——这是安装方向，不是裁切；
+- `camera` 只负责看画面，不运行 dora/键盘。要边走边看，用两个终端：
+  `DUCK_SIM_CAMERAS=a scripts/dora-sim run` 和 `scripts/dora-sim camera`（后者会复用已启动的 twin）。按 W 前先点回运行 dora 的终端，相机窗口会抢焦点；或者 twin 已经起来时直接
+  `scripts/dora-sim drive 0.3`；
+- 需要 Python 的 OpenCV/numpy：`python3 -c "import cv2"`。没有的话 `pip install opencv-python`；
+- 只想快速验证、不弹窗：`scripts/duck-camera-view --socket target/duck-sim/state/duck-a-frame.sock --frames 3 --no-window`。
+
+这条流程不需要浏览器或 WebRTC：窗口直接读 `media.frame` 的原始帧。
 
 ## 手动分步运行
 
@@ -168,6 +191,31 @@ dora run dataflows/sim.yml
 - `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo 才是仿真来源。
 
 下一步是 `perception` + `brain`：把 `image` 变成 `target_visible` / `target_bearing`，再输出 `cmd_vel`，见 `docs/architecture.md` §4。
+
+## 调试：导出 dora 收到的相机帧
+
+`dora-frame-sink` 支持把**它实际收到的** `image` 原样写到磁盘，用于确认 dora 这条路径看到的画面：
+
+```bash
+FRAME_DUMP_DIR=/tmp/duck-frames scripts/dora-sim run --stop-after 5
+ls /tmp/duck-frames
+# frame-000001.uyvy
+# frame-000001.json
+```
+
+- `FRAME_DUMP_EVERY`：每多少帧导出一张，默认 30（30 fps 下约 1 张/秒）；
+- `FRAME_DUMP_LIMIT`：最多导出多少张，默认 10；`0` 表示不限制；
+- `.json` sidecar 带 `width`、`height`、`format`、`rotate`、`captured_at_unix_us`；
+- 原始帧是未旋转的 UYVY。仿真相机是 640×360、安装角 90°，转成 PNG：
+
+```bash
+ffmpeg -f rawvideo -pix_fmt uyvy422 -s 640x360 \
+  -i /tmp/duck-frames/frame-000001.uyvy \
+  -vf transpose=1 /tmp/frame.png
+open /tmp/frame.png
+```
+
+真机如果配的是 720p/1080p，把 `-s` 换成 `1280x720` / `1920x1080`；sidecar 里有准确尺寸。`transpose=1` 是顺时针 90°，和上游 `uyvy::Turn::Right` 的安装修正方向一致。
 
 ## 关于 Cargo.lock
 

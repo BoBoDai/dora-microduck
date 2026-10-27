@@ -5,6 +5,7 @@
 #   scripts/dora-sim                 # start the twin, run the dataflow, stop it
 #   scripts/dora-sim run --stop-after 5
 #   DUCK_SIM_CAMERAS=a scripts/dora-sim   # also start the simulated camera
+#   scripts/dora-sim camera          # open a window with the camera view
 #   scripts/dora-sim up              # start the twin and leave it
 #   scripts/dora-sim status          # health + loop rate
 #   scripts/dora-sim drive 0.3       # walk forward for 8 s
@@ -180,6 +181,20 @@ case "${1:-run}" in
         fi
         run_sim status
         ;;
+    camera)
+        shift
+        if [ -z "${DUCK_SIM_CAMERAS:-}" ]; then
+            DUCK_SIM_CAMERAS="${DUCK#duck-}"
+            export DUCK_SIM_CAMERAS
+        fi
+        if ! is_up; then
+            start_sim
+            STARTED=1
+        fi
+        [ -S "$STATE/$DUCK-frame.sock" ] ||
+            die "no frame socket at $STATE/$DUCK-frame.sock; restart the twin with DUCK_SIM_CAMERAS=${DUCK#duck-}"
+        "$ROOT/scripts/duck-camera-view" --socket "$STATE/$DUCK-frame.sock" "$@"
+        ;;
     status)
         shift
         run_sim status "$@"
@@ -210,6 +225,6 @@ case "${1:-run}" in
         run_sim "$@"
         ;;
     *)
-        die "unknown command '$1' (try: run, up, status, drive, ctl, log, realtime, down)"
+        die "unknown command '$1' (try: run, up, status, drive, ctl, camera, log, realtime, down)"
         ;;
 esac

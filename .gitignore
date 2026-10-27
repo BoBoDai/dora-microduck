@@ -3,3 +3,6 @@
 .DS_Store
 # `dora run` writes per-run logs and a session file here
 /dataflows/out/
+# `scripts/duck-camera-view` is Python; keep bytecode out of the repo
+__pycache__/
+*.pyc

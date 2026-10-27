@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Open a window with the duck's camera view.
+
+Reads raw frames from `mediad`'s `media.frame` endpoint and displays them with
+OpenCV. One frame per connection: the endpoint answers a request and returns,
+so the loop connects again for the next frame.
+
+    scripts/duck-camera-view --socket target/duck-sim/state/duck-a-frame.sock
+
+On a real robot the socket is `/run/mediad/media.sock` and is local to the
+board; from a laptop use the WebRTC console instead. Close the window or press
+`q`/Esc to quit.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+
+import numpy as np
+
+try:
+    import cv2
+except ImportError as exc:  # pragma: no cover - the message is the point
+    raise SystemExit(
+        "OpenCV is required for the camera window: pip install opencv-python"
+    ) from exc
+
+
+class FrameError(Exception):
+    """A frame could not be read or decoded."""
+
+
+def fetch_frame(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2.0)
+        sock.connect(path)
+        sock.sendall(b'{"jsonrpc":"2.0","id":1,"method":"media.frame"}\n')
+
+        reader = sock.makefile("rb")
+        line = reader.readline()
+        if not line:
+            raise FrameError("empty response from mediad")
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as err:
+            raise FrameError(f"bad response: {err}") from err
+        if "error" in response:
+            raise FrameError(f"mediad: {response['error']}")
+
+        info = response.get("result")
+        if not isinstance(info, dict):
+            raise FrameError("response has no frame header")
+        if info.get("format") != "UYVY":
+            raise FrameError(f"unexpected frame format: {info.get('format')!r}")
+
+        remaining = int(info["bytes"])
+        payload = bytearray()
+        while remaining:
+            chunk = reader.read(remaining)
+            if not chunk:
+                raise FrameError("frame payload ended early")
+            payload += chunk
+            remaining -= len(chunk)
+        return info, bytes(payload)
+
+
+def decode(info, payload):
+    width, height = int(info["width"]), int(info["height"])
+    if len(payload) != width * height * 2:
+        raise FrameError(
+            f"payload {len(payload)} B does not match {width}x{height} UYVY"
+        )
+
+    frame = np.frombuffer(payload, dtype=np.uint8).reshape((height, width, 2))
+    image = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_UYVY)
+
+    # `rotate` is the mount angle in degrees clockwise, and the source has
+    # to be turned clockwise by it to become upright. This is the same
+    # direction as `uyvy::Turn::Right` in the upstream monitor.
+    rotate = int(info.get("rotate", 0)) % 360
+    if rotate == 90:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    elif rotate == 180:
+        image = cv2.rotate(image, cv2.ROTATE_180)
+    elif rotate == 270:
+        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return image
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--socket",
+        default=os.environ.get("MEDIA_FRAME_SOCKET", "/run/mediad/media.sock"),
+        help="media.frame socket (default: $MEDIA_FRAME_SOCKET or /run/mediad/media.sock)",
+    )
+    parser.add_argument("--title", default="Microduck camera")
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=0,
+        help="exit after N frames (0 = until the window is closed)",
+    )
+    parser.add_argument(
+        "--no-window",
+        action="store_true",
+        help="decode frames without opening a window (for a quick check)",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.socket):
+        print(f"no frame socket at {args.socket}", file=sys.stderr)
+        print(
+            "start the duck with a camera: DUCK_SIM_CAMERAS=a scripts/dora-sim up",
+            file=sys.stderr,
+        )
+        return 1
+
+    count = 0
+    first = True
+    failures = 0
+    try:
+        while args.frames == 0 or count < args.frames:
+            try:
+                info, payload = fetch_frame(args.socket)
+                image = decode(info, payload)
+            except (OSError, FrameError) as err:
+                failures += 1
+                # A stale socket left by a crashed twin would otherwise make
+                # this loop forever with no window to close.
+                if failures >= 20:
+                    print(
+                        f"camera: no frame after {failures} attempts: {err}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(f"camera: {err}; retrying", file=sys.stderr)
+                time.sleep(0.5)
+                continue
+            failures = 0
+
+            if first:
+                print(
+                    f"camera {info['width']}x{info['height']} {info['format']} "
+                    f"rotate={info.get('rotate', 0)}",
+                    flush=True,
+                )
+                first = False
+
+            count += 1
+            if args.no_window:
+                continue
+
+            cv2.imshow(args.title, image)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            try:
+                if cv2.getWindowProperty(args.title, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if not args.no_window:
+            cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

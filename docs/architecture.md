@@ -414,12 +414,15 @@ dora 提供：
   发布 `image` 和 `width`/`height`/`format`/`rotate` 元数据；`shared_memory_pool_size: 64MB`。
   已用假的 `media.frame` 服务验证协议和 `zenoh direct path`。
 - `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；下一步由 `perception`
-  替换。它的存在也让 camera 的输出有订阅者，从而真正走 SHM 路径。
+  替换。它的存在也让 camera 的输出有订阅者，从而真正走 SHM 路径。设置 `FRAME_DUMP_DIR`
+  可以把收到的原始 UYVY 帧和 `.json` 元数据写到磁盘，供 ffmpeg 离线查看；
+  `FRAME_DUMP_EVERY`（默认 30）和 `FRAME_DUMP_LIMIT`（默认 10，0 = 不限）控制频率和上限。
 - `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo
   才是仿真来源。
 - `dataflows/sim.yml`：五个节点，状态链、相机数据面和控制链分离；假反馈环已删除。
 - `scripts/dora-sim`：负责 twin 生命周期、tty echo、`ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`、
-  `dora run`。
+  `dora run`；`camera` 子命令用 `scripts/duck-camera-view`（Python/OpenCV）打开
+  `media.frame` 窗口。
 
 也就是说：**控制链、状态链和相机数据面现在都是真的。** 缺的是感知和行为。
 
@@ -474,7 +477,8 @@ camera ──image──▶ perception ──target────┘
 - `crates/dora-robotd-wrapper/src/main.rs`：`cmd_vel` → `robot.move`。
 - `crates/dora-mujoco-bridge/src/main.rs`：合成步态 stub（不在 `sim.yml` 中）。
 - `dataflows/sim.yml`：五个节点和各自的 tick。
-- `scripts/dora-sim`：twin 生命周期和 `ROBOTD_SOCKET`。
+- `scripts/dora-sim`：twin 生命周期和 `ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`。
+- `scripts/duck-camera-view`：`media.frame` 相机窗口（Python/OpenCV，调试工具）。
 - `README.md`、`CLAUDE.md`：命令、版本耦合、约定。
 
 上游：
