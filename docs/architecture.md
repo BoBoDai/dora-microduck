@@ -24,8 +24,9 @@
 - 本仓库已经接通控制链、状态链、相机数据面和最小行为闭环：`keyboard → robotd-wrapper →
   robotd`、`robotd → robotd-state → joint_state / odom / imu`，以及
   `mediad → camera → image（SHM）→ perception → target → brain → cmd_vel → wrapper`。
-  `perception` 是最笨的颜色检测，`brain` 是反应式行为 v0；16 状态大脑、mood、NPU 检测器
-  仍然没有。
+  `perception` 是最笨的颜色检测，`brain` 是反应式行为 v0；另外已经把上游 `autod` 的
+  12 状态行为机（energy/mood、novelty grid、ToF 避障）移植成 `dora-autod`。NPU 检测器、
+  上游故意没带的四个状态、手柄接管和音频输入仍然没有。
 
 ## 1. 当前键盘控制
 
@@ -438,6 +439,12 @@ dora 提供：
 - `dataflows/sim.yml`：五个节点，遥操作：键盘控制链、状态链、相机调试消费者；假反馈环已删除。
 - `dataflows/reactive.yml`：五个节点，自主闭环：`camera → perception → brain → wrapper`，
   加上 `robotd-state → brain` 的 IMU；没有键盘。
+- `dora-autod`：上游 `origin/autonomous-mode` 的 `autod` 移植（提交 `df9a750`，Apache-2.0，
+  `crates/dora-autod/LICENSE`）。`brain.rs` 是 12 状态行为机 + energy/mood + novelty grid，
+  `obstacle.rs` 是 ToF 避障；`main.rs` 是 dora 适配层，直接连 `robotd`/`tofd`，发
+  `robot.move/head/mouth/pose/sound/do`。它消费 dora 的 `Event::Stop`，退出前补一帧零速度。
+- `dataflows/autod.yml`：只有一个 `autod` 节点。它还不是 dora 数据面的一部分：state 和
+  ToF 仍走 Unix socket。
 - `scenes/scene_target.xml`：演示世界，标准鸭子 + 前方 0.8 m 一个固定橙色球。球没有碰撞体、
   没有 freejoint，不会被站起来的动作踢走。脚本把它复制到仿真器的 robot 目录，因为模型
   用相对的 `meshdir="assets"`。
@@ -478,12 +485,20 @@ camera ──image──▶ perception ──target──┘
    [visible, bearing, area]`；`brain` 做反应式控制（转向/前进/到达/搜索）。`robotd-wrapper`
    仍是唯一 intent sink。`reactive.yml` 和 `scenes/scene_target.xml` 一起提供可复现的实验；
    细节见 §4.5。实测在 target 场景上找到目标、前进约 0.3 m、在约 0.4–0.5 m 处停下并保持。
-4. **intent arbiter（下一步）**：键盘和 brain 都写 `cmd_vel`，现在不能安全共存。加一个
+4. **上游 autod 移植（已完成）**：把 `origin/autonomous-mode` 的 `autod/src/brain.rs` 和
+   `obstacle.rs` 原样带进 `dora-autod`，配一个 dora 适配层；12 个状态、energy/mood、
+   novelty grid、ToF gate 都在。已在 sim 上跑出 LookAround/Chill/Dance/Zoomies/Wander 和
+   位移。细节见 §4.6。
+5. **autod 的 dora 化（下一步）**：把 `robot.state` 和 `tof.stream` 从 socket 拆成 dora
+   topic，补上手柄接管（`move.source`）、麦克风（`heard`/`petting`）和 v38 `head alpha`。
+   这一步之后，autod 才能和 `robotd-state`/`dora-tof` 共用数据面，而不是自己开 socket。
+6. **intent arbiter**：键盘、reactive brain、autod 都写 intent，现在不能安全共存。加一个
    arbiter 节点（manual 优先/可切换，带超时回退）或给 wrapper 增加第二个输入，再决定
-   哪个是默认写者。这一层应该在 `reactive.yml` 与 `sim.yml` 合并之前完成。
-5. **管理**：YAML 加 `restart_policy: on-failure`、`startup_timeout`、
+   哪个是默认写者。这一层应该在合并 `sim.yml`/`reactive.yml`/`autod.yml` 之前完成。
+7. **管理**：YAML 加 `restart_policy: on-failure`、`startup_timeout`、
    `health_check_timeout`；切片稳定后再加 `dora up` + `scripts/dora-sim managed`。
-6. **之后**：16 状态大脑、NPU 鸭子检测器、真机部署、板载资源测量。
+8. **之后**：上游故意没带的 BallPlay/Held/Startle/Preen、NPU 鸭子检测器、真机部署、
+   板载资源测量。
 
 ### 4.4 验收
 
@@ -497,6 +512,9 @@ camera ──image──▶ perception ──target──┘
   `mode=arrived`，odom x 约 0.02 → 0.32）。
 - 目标丢失 300 ms 后进入 `mode=search`，8 s 后停止；IMU 倾角超过 45°、IMU 超过 500 ms
   未更新或没有 IMU 时发零（单元测试覆盖；真机还需要实测策略对 1.5 rad/s 的响应）。
+- 上游 autod 移植已用 `scripts/dora-sim autod --stop-after 60` 验证：ToF 流到达，状态机
+  出现 LookAround/Chill/Dance/Zoomies/Wander，odom 有位移；`--stop-after` 通过
+  `Event::Stop` 干净退出，不触发 dora 的 kill grace（已完成）。
 - brain 被杀掉时，`robotd` 的 deadman 让鸭子停下；如果加了 restart policy，brain 能回来。
 - `dora node list` 显示所有节点健康。
 
@@ -615,6 +633,67 @@ robotd-state.imu (f32[7])
 - 目前没有 arbiter，`sim.yml` 和 `reactive.yml` 不能同时跑；也没有多目标、目标身份、
   16 状态、mood、记忆和 NPU。`brain` 是行为层 v0，不是替代上游大脑。
 
+### 4.6 上游 autod 的移植
+
+#### 来源与范围
+
+- 源：`pollen-robotics/microduck` 的 `origin/autonomous-mode`，提交 `df9a750e95ac5a57f7efeb0cf158a4092167018e`。
+- `crates/dora-autod/src/brain.rs`、`obstacle.rs` 是上游代码，保留 Apache-2.0
+  （`crates/dora-autod/LICENSE`）；`main.rs` 是本仓库的 dora 适配层。
+- 上游文档说 16 状态，但当前分支故意只带 12 个：`BallPlay`（缺球检测器）、`Held`
+  （抱起步检测废弃）、`Startle`、`Preen`（效果不好）不在移植范围。不要为了凑 16 个自己
+  发明四个状态。
+
+#### 形状
+
+```
+robotd ──robot.state（50 Hz）──┐
+                               ├──▶ dora-autod ──▶ robot.move / robot.head / robot.mouth
+tofd   ──tof.stream（15 Hz）───┘                └──▶ robot.pose / robot.sound / robot.do
+```
+
+`dora-autod` 是 `autod.yml` 里唯一的节点，直接开三个连接：命令（请求/通知）、状态订阅、
+ToF 订阅。它没有 dora 输入/输出，所以目前不能在 `dora topic` 里看到 state/ToF；这是第一
+版的取舍，不是目标架构。它消费 `Event::Stop`，退出前发一帧零 `robot.move`，避免 dora 等到
+kill grace。
+
+#### 行为
+
+12 个状态和上游一样：Chill、LookAround、Wander、TurnInPlace、Zoomies、Stretch、Ruffle、
+Dance、Sneeze、GroundPick、Nap、Petted。核心不是状态名，而是：
+
+- **energy/mood**：走路/zoomies 消耗，chill/nap/petting 恢复；影响状态权重、速度、叫声频率。
+- **novelty grid**：0.5 m 格子，记录停留时间，约 15 分钟衰减；Wander 目标朝没去过的空间，
+  并避开最近被障碍挡住的方向。
+- **ToF gate**：按 `t_ns` 把帧和最近的状态配对；用 IMU 重力把 beam 水平化；只信可信
+  status；同一 hit 需要邻域确认；障碍记在 odometry 帧里并随鸭子移动重新表达；按距离
+  减速/转向/停。没有 ToF 时只转不走。
+- **Wander 的最小速度**：策略在低速下站着不动，所以 `autod` 从不请求低于 0.15 m/s 的
+  `vx`，每次起步先给 0.6 s 全速。
+- **声音/头部/身体**：叫声、张嘴、头部动画、Dance/Stretch/Petted 的 body pose 都通过
+  `robot.head/mouth/pose/sound` 发出。
+
+#### 当前未接
+
+- 麦克风：`heard`/`petting` 固定为 `None`/`false`，`Petted` 不会触发，Petted 的声音反应
+  也不会有。
+- 手柄接管：上游靠 `robot.state.move.source == "padd"` 判断；当前 submodule 主分支 proto
+  没有 `source`，所以没有让位逻辑。跑 autod 时不要同时用手柄。
+- 开机自站：上游的 `robot.init`/`robot.enable` 一次-per-boot 逻辑没带；sim 由
+  `scripts/dora-sim` 站，真机由 Start/robotctl 站。
+- v38 的 `robot.head alpha`：主分支 `HeadParams` 没有这个字段，快速甩头被默认平滑削弱。
+- dora 化：state/ToF 仍是 socket；下一步拆 topic 后才能和 `robotd-state`/`dora-tof` 共享。
+
+#### 验证
+
+- `cargo test -p dora-autod`：20 个上游测试全过（十分钟行为不越界、Wander 到目标、避开
+  被挡方向、无 ToF 不前进、GroundPick 等待 busy、坐着的鸭子会被站起来、声音回答等）。
+- 本机 `DUCK_SIM_VIEWER=0 scripts/dora-sim autod --stop-after 60`：日志出现
+  `depth frames arriving — obstacle avoidance on`，状态依次有 LookAround、Chill、Dance、
+  Zoomies、Wander，odom 有位移；没有协议拒绝。`--stop-after` 通过 `Event::Stop` 干净退出。
+- 未能验证：真实手柄接管、麦克风/Petted、真机 head alpha、GroundPick/Nap 在 sim 里的
+  完整技能时长（状态机测试覆盖，但 60 s 随机运行没有必然抽到）。
+
 ## 5. 参考
 
 本仓库：
@@ -624,11 +703,14 @@ robotd-state.imu (f32[7])
 - `crates/dora-camera/src/main.rs`：`media.frame` → `image`，二进制尾部直接读进 sample。
 - `crates/dora-perception/src/main.rs`：UYVY 颜色检测、旋转坐标映射、`target` 输出。
 - `crates/dora-brain/src/main.rs`：反应式控制、滞回、搜索、IMU/倾角保护。
+- `crates/dora-autod/src/brain.rs`、`obstacle.rs`：上游 12 状态行为机与 ToF 避障（Apache-2.0）。
+- `crates/dora-autod/src/main.rs`：dora 适配层、socket 订阅与 intent 发送。
 - `crates/dora-frame-sink/src/main.rs`：调试消费者，原地读 `Uint8Array`。
 - `crates/dora-robotd-wrapper/src/main.rs`：`cmd_vel` → `robot.move`。
 - `crates/dora-mujoco-bridge/src/main.rs`：合成步态 stub（不在数据流中）。
 - `dataflows/sim.yml`：遥操作五个节点和各自的 tick。
 - `dataflows/reactive.yml`：自主闭环五个节点。
+- `dataflows/autod.yml`：上游 autod 的单节点图。
 - `scenes/scene_target.xml`：固定橙色目标的演示世界。
 - `scripts/dora-sim`：twin 生命周期、`ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`、target 场景。
 - `scripts/duck-camera-view`：`media.frame` 相机窗口（Python/OpenCV，调试工具）。
@@ -642,6 +724,10 @@ robotd-state.imu (f32[7])
 - `vendor/microduck/docs/robot/simulation.md`（`robotd --sim`、`tofd --sim`、
   `mediad --sim-camera`、`DUCK_SIM_CAMERAS`）。
 - `vendor/microduck/docs/ideas/autonomous_behavior.md`（16 状态机、缺失的大脑）。
+- `origin/autonomous-mode:autod/src/brain.rs`、`autod/src/obstacle.rs` 和
+  `docs/design/autonomous.md`（上游 12 状态移植、energy/mood、novelty grid、ToF gate；
+  提交 `df9a750`）。
+- `vendor/microduck/kinematics/src/tof.rs`（ToF beam 反投影、Posture、Zone）。
 - `vendor/microduck/docs/project/npu-bringup.md`（检测器和缺失的帧路径）。
 - `vendor/microduck/duck-ipc-proto/src/lib.rs`（`robot.*` 方法、`RobotState`、`media.frame`、
   `MediaFrameHeader`、`JOINT_NAMES`）。

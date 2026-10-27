@@ -1,0 +1,16 @@
+[package]
+name = "dora-autod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Dora node running the upstream autod brain (state machine and ToF obstacle model)"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+dora-node-api.workspace = true
+duck-ipc-proto.workspace = true
+kinematics.workspace = true
+serde_json.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

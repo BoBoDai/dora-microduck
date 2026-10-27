@@ -55,6 +55,7 @@ flowchart TB
     sink["frame-sink（调试）"]
     percep["perception"]
     brain["brain"]
+    autod["autod（上游 12 状态）"]
     arb["intent arbiter（计划）"]
   end
 
@@ -83,7 +84,11 @@ flowchart TB
   camera ==>|"image（SHM，reactive.yml）"| percep
   percep -->|"target"| brain
   brain -->|"cmd_vel（reactive.yml）"| wrapper
+  robotd -.->|"robot.state（autod.yml）"| autod
+  tofd -.->|"tof.stream（autod.yml）"| autod
+  autod -->|"robot.move/head/mouth/pose/sound/do"| robotd
   brain -.->|"cmd_vel（计划）"| arb
+  autod -.->|"全部 intent（计划）"| arb
   arb -.->|"cmd_vel（计划）"| wrapper
 
   mediad ==>|"WebRTC H.264 + control"| space
@@ -111,11 +116,13 @@ flowchart TB
   `media.frame`（给本机 perception）。
 - `tofd` 单独拥有 ToF，不经过 `robotd`。
 - `configd` / `updaterd` / `btd` 是恢复路径：它们不依赖 `robotd`，`robotd` 死了也要能工作。
-- dora 有两条**互斥**的当前控制链：`sim.yml` 的 `keyboard → wrapper`，和 `reactive.yml`
-  的 `camera → perception → brain → wrapper`。两张图不要同时跑；虚线框的 intent arbiter
-  是合并它们之前要补的仲裁层。
-- `state`、`camera`、`perception`、`brain` 都是当前实现；`perception` 和 `brain` 只在
-  `reactive.yml` 里连接。
+- dora 有**三条互斥**的当前控制链：`sim.yml` 的 `keyboard → wrapper`、`reactive.yml` 的
+  `camera → perception → brain → wrapper`，以及 `autod.yml` 的
+  `robotd/tofd → autod → robotd`。三张图不要同时跑；虚线框的 intent arbiter 是合并它们
+  之前要补的仲裁层。
+- `autod` 和另外两条链不同：它不经过 dora topic，而是直接开 `robotd`/`tofd` socket，所以
+  图里画的是 socket 关系。这是第一版移植的取舍。
+- `state`、`camera`、`perception`、`brain`、`autod` 都是当前实现；只有前四个走 dora 消息。
 
 ## 2. 调用流程（当前真实路径）
 
@@ -182,6 +189,9 @@ flowchart TD
 - 相机路径在 `sim.yml` 是 `mediad → camera → image → frame-sink`，在 `reactive.yml` 是
   `mediad → camera → image → perception → brain`，都不经过 `robotd`，也不在上面这张键盘
   流程图里。`frame-sink` 是调试消费者；`perception` 是真实消费者，两者属于不同的图。
+- `autod.yml` 是第三条独立链：`robotd ──robot.state──▶ autod ──intents──▶ robotd`，外加
+  `tofd ──tof.stream──▶ autod`。它不用相机、不经过 wrapper，直接发全部 intent；因此
+  它的状态/ToF 还不在 dora topic 里。
 
 ## 3. 两条控制链的时序
 
@@ -232,6 +242,8 @@ sequenceDiagram
   `allocate_data_sample` + `encode_uint8_ipc_header` + `send_output_sample` 把二进制尾部
   直接读进 sample，效果等同于 `send_output_raw` 的 0 拷贝路径；接收端 `values()` 直接
   alias 那块内存。`send_output`（Arrow 数组）则是 1 拷贝。
+- `autod.yml` 不在这张时序里：`autod` 直接向 `robotd` 订阅 `robot.state`、向 `tofd`
+  订阅 `tof.stream`，再直接发全部 intent；它没有 dora 输入/输出，也不经过 wrapper。
 
 ## 4. 调用关系表
 
@@ -258,6 +270,8 @@ sequenceDiagram
 | dora `perception` | dora `brain` | `target = [visible, bearing, area]` | dora 消息 |
 | dora `robotd-state` | dora `brain` | `imu = [qw, qx, qy, qz, gx, gy, gz]` | dora 消息 |
 | dora `brain`（reactive.yml） | `robotd-wrapper` | `cmd_vel` | dora 消息 |
+| dora `autod`（autod.yml） | `robotd` | `robot.state` 订阅 / `robot.move`、`robot.head`、`robot.mouth`、`robot.pose`、`robot.sound`、`robot.do` | socket（订阅 + notification/request） |
+| `tofd` | dora `autod`（autod.yml） | `tof.stream` → `tof.frame` | socket 订阅 |
 | dora `keyboard` / `brain`（计划） | `intent arbiter` | `cmd_vel`（manual / auto） | dora 消息（计划） |
 | `intent arbiter`（计划） | `robotd-wrapper` | `cmd_vel` | dora 消息（计划） |
 | `updaterd` | `robotd` | `robot.health` | 请求/响应 |
@@ -281,7 +295,7 @@ sequenceDiagram
 - **恢复路径不能被 dora 依赖。** `configd`、`updaterd`、`btd` 在 `robotd` 死掉时仍要工作；
   dora 挂在它们上面会把恢复路径变成“先有 dora 才能修机器人”。
 - **跨机不共享内存。** `media.frame` 和 dora 的 SHM 都是同机路径；跨机走 WebRTC/网络。
-- **`sim.yml` 和 `reactive.yml` 互斥。** 当前键盘和 brain 都直接写 wrapper 的 `cmd_vel`，
-  同时运行是 last-writer-wins；arbiter 落地之前，手动接管要先停掉 `reactive`。
+- **`sim.yml`、`reactive.yml` 和 `autod.yml` 互斥。** 键盘、reactive brain 和 autod 都写
+  intent，同时运行是 last-writer-wins；arbiter 落地之前，手动接管要先停掉另外两张图。
 - **`brain` 不是安全层。** 它会在倾角/IMU 超时/目标丢失时发零，但真正的关节限位、跌倒
   失力和 deadman 仍在 `robotd`。

@@ -7,6 +7,7 @@
 #   DUCK_SIM_CAMERAS=a scripts/dora-sim   # also start the simulated camera
 #   scripts/dora-sim camera          # open a window with the camera view
 #   scripts/dora-sim reactive        # camera -> perception -> brain -> robotd
+#   scripts/dora-sim autod           # upstream autod brain (12 states + ToF)
 #   scripts/dora-sim up              # start the twin and leave it
 #   scripts/dora-sim status          # health + loop rate
 #   scripts/dora-sim drive 0.3       # walk forward for 8 s
@@ -205,6 +206,31 @@ cmd_reactive() {
     ROBOTD_SOCKET="$SOCK" dora run "$ROOT/dataflows/reactive.yml" "$@"
 }
 
+cmd_autod() {
+    command -v cargo >/dev/null || die "cargo not found"
+    command -v dora >/dev/null || die "dora CLI not found; cargo install dora-cli --version 1.1.0"
+
+    say "building the upstream autod brain"
+    ( cd "$ROOT" && cargo build --quiet -p dora-autod )
+
+    if is_up; then
+        say "using the running twin at $SOCK"
+    else
+        start_sim
+        STARTED=1
+    fi
+
+    TOF_SOCKET="$STATE/$DUCK-tof.sock"
+    if [ ! -S "$TOF_SOCKET" ]; then
+        die "no ToF socket at $TOF_SOCKET; this twin has no depth, and autod will not walk"
+    fi
+    export TOF_SOCKET
+
+    say "autod: upstream 12-state brain (ToF obstacle gate); no keyboard; Ctrl-C ends"
+    say "this script then takes the twin down"
+    ROBOTD_SOCKET="$SOCK" dora run "$ROOT/dataflows/autod.yml" "$@"
+}
+
 case "${1:-run}" in
     run)
         if [ "$#" -gt 0 ]; then
@@ -243,6 +269,10 @@ case "${1:-run}" in
         shift
         cmd_reactive "$@"
         ;;
+    autod)
+        shift
+        cmd_autod "$@"
+        ;;
     status)
         shift
         run_sim status "$@"
@@ -273,6 +303,6 @@ case "${1:-run}" in
         run_sim "$@"
         ;;
     *)
-        die "unknown command '$1' (try: run, reactive, up, status, drive, ctl, camera, log, realtime, down)"
+        die "unknown command '$1' (try: run, reactive, autod, up, status, drive, ctl, camera, log, realtime, down)"
         ;;
 esac

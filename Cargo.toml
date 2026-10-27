@@ -19,6 +19,7 @@ rust-version = "1.95"
 # speak the same protocol.
 dora-node-api = "1.1.0"
 duck-ipc-proto = { path = "vendor/microduck/duck-ipc-proto" }
+kinematics = { path = "vendor/microduck/kinematics" }
 eyre = "0.6"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

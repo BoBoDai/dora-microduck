@@ -1,0 +1,24 @@
+# Upstream autonomous brain (`autod`) as a dora node.
+#
+#   cargo build
+#   scripts/dora-sim autod
+#
+# This is the port of `pollen-robotics/microduck`'s `autod` branch
+# (`origin/autonomous-mode`, commit df9a750): a 12-state behaviour machine on
+# the energy/mood model, plus the ToF obstacle gate. Upstream deliberately left
+# BallPlay, Held, Startle and Preen behind; the 16-state runtime source is not
+# public.
+#
+# Unlike `reactive.yml`, this node owns the body and reads its sensors over the
+# same sockets the upstream daemon does:
+#
+#   robotd ──robot.state──▶ dora-autod ──▶ robot.move / robot.head / robot.mouth
+#   tofd   ──tof.stream───▶              ──▶ robot.pose / robot.sound / robot.do
+#
+# `ROBOTD_SOCKET` is required; `TOF_SOCKET` is optional (without depth the
+# brain looks around but never advances). `scripts/dora-sim autod` sets both
+# and starts/reuses the twin. There is no keyboard in this graph and no pad
+# takeover yet: the first port does not wire `robot.state.move.source`.
+nodes:
+  - id: autod
+    path: ../target/debug/dora-autod
