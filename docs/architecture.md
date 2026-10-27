@@ -228,7 +228,9 @@ struct Hold {
   里程计、IPC 全是真机代码，不区分仿真。
 - `tofd --sim` 从同一个仿真器拿 8×8 深度；`mediad --sim-camera` 拿渲染出来的头部相机图像。
 - `scripts/duck-sim` 负责 body、daemon、策略、socket、健康检查和站立。
-- 相机是 opt-in：`DUCK_SIM_CAMERAS=a`；相机帧端口默认 7901，每个相机 +1。
+- 相机是 opt-in：`DUCK_SIM_CAMERAS=a`；相机帧端口默认 7901，每个相机 +1。macOS 需要
+  GStreamer；仿真默认 `360p30`，按 90° 安装角转正后是竖屏（360×640）。当前 macOS 上
+  `apartment` 场景会让 `body_server` segfault，默认场景是安全的。
 - 仿真 socket 在状态目录下：`duck-a.sock`（robotd）、`duck-a-tof.sock`、`duck-a-frame.sock`
   （`media.frame`）。真机上分别是 `/run/robotd.sock`、`/run/tofd/tof.sock`、
   `/run/mediad/media.sock`。
@@ -412,7 +414,8 @@ dora 提供：
   重连并重新订阅。
 - `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，把 IPC 头和二进制尾部直接写进 sample，
   发布 `image` 和 `width`/`height`/`format`/`rotate` 元数据；`shared_memory_pool_size: 64MB`。
-  已用假的 `media.frame` 服务验证协议和 `zenoh direct path`。
+  已在真实 sim 相机上验证（640×360、30 fps、`zenoh direct path` + SHM），也验证过假的
+  `media.frame` 服务；`scripts/dora-sim camera` 直接看画面，`FRAME_DUMP_DIR` 导出帧。
 - `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；下一步由 `perception`
   替换。它的存在也让 camera 的输出有订阅者，从而真正走 SHM 路径。设置 `FRAME_DUMP_DIR`
   可以把收到的原始 UYVY 帧和 `.json` 元数据写到磁盘，供 ffmpeg 离线查看；
@@ -460,8 +463,9 @@ camera ──image──▶ perception ──target────┘
 
 - `joint_state` / `odom` 来自真实 `robot.state`，不再是合成步态；smoke test 的首帧已是站立时
   的真实值（已完成）。
-- 相机帧（>4 KB）在日志里走 `zenoh direct path`，不是 `daemon path`；已用假 `media.frame`
-  服务验证（已完成）。模拟相机本身还需要 GStreamer。
+- 相机帧（>4 KB）在日志里走 `zenoh direct path`，不是 `daemon path`；已在真实 sim 相机
+  （640×360）和假 `media.frame` 服务上验证（已完成）。GStreamer 已安装；`apartment` 场景
+  当前会让 `body_server` segfault，默认场景可用。
 - 目标进入视野时鸭子转向/前进，目标丢失时停下。
 - brain 被杀掉时，`robotd` 的 deadman 让鸭子停下；如果加了 restart policy，brain 能回来。
 - `dora node list` 显示所有节点健康。

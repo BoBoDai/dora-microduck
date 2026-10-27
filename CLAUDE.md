@@ -11,6 +11,8 @@ A [dora-rs](https://dora-rs.ai/) dataflow that drives a [Microduck](https://gith
 - **Rust**: `rust-toolchain.toml` pins the `stable` channel. The workspace MSRV is 1.95 because `dora-node-api` 1.1.0 requires it.
 - **dora CLI must match the `dora-node-api` version** in `Cargo.toml` (currently 1.1.0). Node/daemon protocol is not compatible across versions; bumping the crate without reinstalling the CLI leaves a dataflow that starts but cannot communicate.
 - **The submodule must be initialized** before building — the path dependencies point into it.
+- **The simulated camera is optional** (`DUCK_SIM_CAMERAS=a`): it needs GStreamer. On macOS `brew install gstreamer libnice-gstreamer`; on a board the upstream `vendor/microduck/scripts/setup-gstreamer.sh` installs it. The dora nodes themselves do not link GStreamer; the real `mediad` does.
+- **`scripts/dora-sim camera` needs Python 3 + OpenCV/numpy.** Without `cv2`, use `scripts/dora-sim run` and the frame-sink dump instead.
 
 ```bash
 git submodule update --init --recursive
@@ -36,6 +38,9 @@ scripts/dora-sim run --stop-after 5
 scripts/dora-sim up | status | drive 0.3 | ctl health | down
 scripts/dora-sim camera           # OpenCV window over media.frame; starts the twin if needed
 
+# Raw frames out of the dora camera node (one .uyvy + one .json per dump).
+DUCK_SIM_CAMERAS=a FRAME_DUMP_DIR=/tmp/duck-frames scripts/dora-sim run --stop-after 5
+
 # Dataflow only (the twin must already be running for cmd_vel to reach robotd).
 dora run dataflows/sim.yml
 dora run dataflows/sim.yml --stop-after 10   # 1.1.0 accepts bare seconds
@@ -46,7 +51,7 @@ dora graph dataflows/sim.yml --mermaid
 
 - `dora run` starts an isolated local daemon and exits once the dataflow stops; `dora up` is not needed.
 - Per-run logs and the session file land in `dataflows/out/`, which is gitignored.
-- `cargo test --workspace` runs the keyboard parser tests; target one crate with `cargo test -p dora-keyboard`.
+- `cargo test --workspace` runs the keyboard parser tests plus the state/camera/frame-sink unit tests; target one crate with `cargo test -p dora-keyboard`.
 - `dora run dataflows/sim.yml --stop-after 4` without `ROBOTD_SOCKET`/`MEDIA_FRAME_SOCKET` is a graph-only smoke test: `robotd-state` logs that no state will be published, `camera` logs that no frames will be published, the wrapper logs one `cmd_vel … (no ROBOTD_SOCKET)` line, and without a controlling terminal the keyboard logs "keyboard disabled" and publishes zeros. That is expected. The real end-to-end test is `scripts/dora-sim run --stop-after 5`, which should show `dora-robotd-state: subscribed to …` and `published N robot states`, then stop the twin cleanly. Add `DUCK_SIM_CAMERAS=a` to exercise `dora-camera`; that path needs GStreamer, and `duck-sim` refuses to start a camera without it.
 - `scripts/dora-sim run` is the end-to-end launcher test: it should print "standing", connect the wrapper to `target/duck-sim/state/duck-a.sock`, run the dataflow, then "stopping the MuJoCo twin" with no leftover processes.
 
@@ -97,7 +102,7 @@ mediad ──media.frame──▶ camera ──image (SHM)──▶ frame-sink (
 4. It exports `ROBOTD_SOCKET` and runs `dora run` in the foreground. With `DUCK_SIM_CAMERAS=a` it also exports `MEDIA_FRAME_SOCKET` for the simulated camera's `media.frame` socket; that option needs GStreamer, and the upstream launcher refuses to start a camera without it.
 5. On exit it runs `duck-sim down` **only if it started the twin**; an already-running twin is left alone.
 
-`scripts/dora-sim camera` is a separate viewer, not part of the dataflow: it starts the twin with `DUCK_SIM_CAMERAS` set to the selected duck's letter if none is running, then runs `scripts/duck-camera-view` (Python + OpenCV) against `media.frame`. If it started the twin, the exit trap stops it; an already-running twin is left alone. The viewer is a debug tool, not a dora node.
+`scripts/dora-sim camera` is a separate viewer, not part of the dataflow: it starts the twin with `DUCK_SIM_CAMERAS` set to the selected duck's letter if none is running, then runs `scripts/duck-camera-view` (Python + OpenCV) against `media.frame`. If it started the twin, the exit trap stops it; an already-running twin is left alone. The viewer is a debug tool, not a dora node. It does **not** run dora or the keyboard: to walk while watching, run `scripts/dora-sim run` and `scripts/dora-sim camera` in two terminals and focus the dora terminal before pressing keys, or use `scripts/dora-sim drive`. The view is portrait because the camera is mounted 90°; the `apartment` scene currently segfaults `body_server` on macOS, so the default scene is the safe one.
 
 Do **not** turn the upstream daemons into dora nodes. `robotd` is binary-only and safety-critical; `btd`/`configd`/`updaterd` must survive a dead `robotd` and depend on systemd units and socket permissions. Dora owns the graph; systemd/upstream owns the daemons. The one seam worth taking over later is the MuJoCo body protocol from `duck_control::sim` (`hello/read/write/gain/torque/slow`, protocol 1).
 

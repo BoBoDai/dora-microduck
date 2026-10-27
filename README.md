@@ -30,6 +30,11 @@
 └── README.md
 ```
 
+## 文档
+
+- [`docs/architecture.md`](docs/architecture.md)：键盘实现、上游 Microduck 架构、dora 的插入点和当前状态。
+- [`docs/call-graph.md`](docs/call-graph.md)：调用关系图、调用流程和调用表。
+
 ## 前置条件
 
 - Rust 1.95+（stable；仓库内的 `rust-toolchain.toml` 已固定到 stable）
@@ -45,13 +50,22 @@ dora --version   # dora-cli 1.1.0
 cargo install dora-cli --version 1.1.0 --locked
 ```
 
-**可选：模拟相机。** 只有 `DUCK_SIM_CAMERAS=a` 时才需要 GStreamer。macOS：
+**可选：模拟相机。** 在这个仓库的仿真里，只有 `DUCK_SIM_CAMERAS=a` 时才需要 GStreamer。macOS：
 
 ```bash
 brew install gstreamer libnice-gstreamer
 ```
 
-板子上由 `scripts/setup-gstreamer.sh` 安装。没有 GStreamer 时数据流照常运行，只是 `camera` 节点拿不到帧。
+真机的 `mediad` 本身也依赖 GStreamer；板子上由上游的
+`vendor/microduck/scripts/setup-gstreamer.sh` 安装（provisioning / preinstall 会自动跑）。没有
+GStreamer 时数据流照常运行，只是 `camera` 节点拿不到帧。
+
+**可选：相机窗口。** `scripts/dora-sim camera` 需要 Python 3 + OpenCV/numpy：
+
+```bash
+python3 -c "import cv2, numpy"
+# 没有的话：pip install opencv-python
+```
 
 ## 初始化
 
@@ -85,7 +99,7 @@ scripts/dora-sim down             # 关闭 twin
 
 - `run` 必须在前台终端执行：键盘节点读 `/dev/tty`，dora 给节点的 stdin 是 null
 - 脚本会自动设置 `ROBOTD_SOCKET=target/duck-sim/state/duck-a.sock`：`cmd_vel` 直接进模拟的 robotd，`robotd-state` 也从这里订阅状态
-- 启用模拟相机时，脚本还会设置 `MEDIA_FRAME_SOCKET=target/duck-sim/state/duck-a-frame.sock`；没启用时 `camera` 节点打印 `camera disabled`，其余图照常运行
+- 启用模拟相机时，脚本还会设置 `MEDIA_FRAME_SOCKET=target/duck-sim/state/duck-a-frame.sock`；没启用时脚本提示 `camera disabled`，`camera` 节点打印 `MEDIA_FRAME_SOCKET is not set; no frames will be published`，其余图照常运行
 - MuJoCo body 从 `microduck_rl` 的 `origin/develop` 提取到 `target/duck-sim/rl`（不修改那个仓库）；可用 `MICRODUCK_RL`、`MICRODUCK_RL_REF`、`DUCK_SIM_DUCK` 覆盖
 - 如果 twin 已经在运行，`run` 会复用它，退出时也不会关掉它；只有本次启动的才会在退出时 `down`
 
@@ -101,7 +115,8 @@ scripts/dora-sim camera
 - 默认场景是光板地面，窗口里可能只是一片地面/网格；想看房间用
   `DUCK_SIM_SCENE=apartment scripts/dora-sim camera`；不想同时看到 MuJoCo 仿真窗口就加
   `DUCK_SIM_VIEWER=0`；
-- 相机是 90° 侧装的，转正后画面是 360×640 竖屏，所以窗口是竖条——这是安装方向，不是裁切；
+- 当前 macOS + microduck_rl 的 `apartment` 场景会让 MuJoCo `body_server` segfault；遇到就回到默认场景；
+- 相机是 90° 侧装的，转正后画面是竖屏（仿真 360×640，真机 720×1280），所以窗口是竖条——这是安装方向，不是裁切；
 - `camera` 只负责看画面，不运行 dora/键盘。要边走边看，用两个终端：
   `DUCK_SIM_CAMERAS=a scripts/dora-sim run` 和 `scripts/dora-sim camera`（后者会复用已启动的 twin）。按 W 前先点回运行 dora 的终端，相机窗口会抢焦点；或者 twin 已经起来时直接
   `scripts/dora-sim drive 0.3`；
@@ -179,6 +194,21 @@ dora run dataflows/sim.yml
 
 `robotd-wrapper` 和 `robotd-state` 都读 `ROBOTD_SOCKET`：前者发 `robot.move`，后者订阅 `robot.state`。`camera` 读 `MEDIA_FRAME_SOCKET`；不设置时它只打印 `no frames will be published`。
 
+## 构建与测试
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`cargo test --workspace` 覆盖键盘解析、状态节点的解析/转换、相机节点的协议头解析和帧导出逻辑。端到端 smoke test：
+
+```bash
+scripts/dora-sim run --stop-after 5
+# 带相机：DUCK_SIM_CAMERAS=a scripts/dora-sim run --stop-after 5
+```
+
 ## 当前状态
 
 数据流的五个节点都能构建、能跑通。控制链、状态链和相机数据面现在都是真的：
@@ -186,8 +216,8 @@ dora run dataflows/sim.yml
 - `dora-keyboard`：终端键盘已经可用（`/dev/tty` + termios raw mode）。
 - `dora-robotd-wrapper`：纯 intent sink，`cmd_vel` 转成 `robot.move` 发到 `ROBOTD_SOCKET`；不再镜像 `joint_state`。
 - `dora-robotd-state`：通过 `robot.subscribe` 订阅 `robot.state`，发布 `joint_state`（15 个关节）、`odom` 和 `imu`；robotd 重启后会自动重连。
-- `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，直接写进 SHM sample；`shared_memory_pool_size: 64MB`。已用假的 `media.frame` 服务验证过协议和 `zenoh direct path`；模拟相机需要 `DUCK_SIM_CAMERAS=a` 和 GStreamer。
-- `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；下一步由 `perception` 替换。
+- `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，直接写进 SHM sample；`shared_memory_pool_size: 64MB`。已在真实 sim 相机上验证（640×360、30 fps、`zenoh direct path` + SHM）；`scripts/dora-sim camera` 直接看画面，`FRAME_DUMP_DIR` 导出帧。
+- `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；支持 `FRAME_DUMP_DIR` 导出，下一步由 `perception` 替换。
 - `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo 才是仿真来源。
 
 下一步是 `perception` + `brain`：把 `image` 变成 `target_visible` / `target_bearing`，再输出 `cmd_vel`，见 `docs/architecture.md` §4。
@@ -197,11 +227,13 @@ dora run dataflows/sim.yml
 `dora-frame-sink` 支持把**它实际收到的** `image` 原样写到磁盘，用于确认 dora 这条路径看到的画面：
 
 ```bash
-FRAME_DUMP_DIR=/tmp/duck-frames scripts/dora-sim run --stop-after 5
+DUCK_SIM_CAMERAS=a FRAME_DUMP_DIR=/tmp/duck-frames scripts/dora-sim run --stop-after 5
 ls /tmp/duck-frames
 # frame-000001.uyvy
 # frame-000001.json
 ```
+
+`run` 会复用已经运行的 twin；如果它启动时没有相机，先 `scripts/dora-sim down` 再执行上面的命令。
 
 - `FRAME_DUMP_EVERY`：每多少帧导出一张，默认 30（30 fps 下约 1 张/秒）；
 - `FRAME_DUMP_LIMIT`：最多导出多少张，默认 10；`0` 表示不限制；
@@ -216,6 +248,20 @@ open /tmp/frame.png
 ```
 
 真机如果配的是 720p/1080p，把 `-s` 换成 `1280x720` / `1920x1080`；sidecar 里有准确尺寸。`transpose=1` 是顺时针 90°，和上游 `uyvy::Turn::Right` 的安装修正方向一致。
+
+## 常见问题
+
+**相机窗口为什么是竖的？**
+相机在头上是 90° 侧装的；传感器是 640×360 横屏（真机 1280×720），转正后就是 360×640（真机 720×1280）竖屏。这是安装方向，不是裁切。上游 `robotctl monitor` 的相机块也是同样的竖幅。
+
+**打开 `camera` 窗口后按 W 不动？**
+`scripts/dora-sim camera` 只开窗口，不运行 dora/键盘。要边走边看，用两个终端：`DUCK_SIM_CAMERAS=a scripts/dora-sim run` 和 `scripts/dora-sim camera`；按 W 前点回运行 dora 的终端（相机窗口会抢焦点）。或者 twin 已经起来时用 `scripts/dora-sim drive 0.3`。
+
+**为什么浏览器打不开 `:8080`？**
+那是上游 `mediad` 自带的 WebRTC 控制台，不是本项目的相机窗口流程，也不是必须的。它需要 twin 常驻且 WebRTC 正常；本项目用 `scripts/dora-sim camera` 直接读 `media.frame`，不经过浏览器。
+
+**`DUCK_SIM_SCENE=apartment` 起不来？**
+当前 macOS + microduck_rl 的 `apartment` 场景会让 MuJoCo `body_server` segfault；用默认场景即可。
 
 ## 关于 Cargo.lock
 
