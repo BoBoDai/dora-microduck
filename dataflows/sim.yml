@@ -12,9 +12,18 @@
 #
 #   keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd
 #
-# `robotd-state` subscribes on ROBOTD_SOCKET; without it the node logs that no
-# state will be published and the graph still runs. The wrapper forwards
-# commands to the same socket, or logs them when it is unset.
+#   mediad ──media.frame──▶ camera ──image (SHM)──▶ frame-sink (debug)
+#
+# `robotd-state` subscribes on ROBOTD_SOCKET; `camera` pulls raw frames on
+# MEDIA_FRAME_SOCKET. Both log and publish nothing when their socket is unset,
+# and the rest of the graph still runs. For the simulated camera, start the twin
+# with `DUCK_SIM_CAMERAS=a` so `duck-sim` runs `mediad --sim-camera`; the
+# launcher then exports the matching frame socket. A real robot uses
+# `/run/mediad/media.sock`.
+#
+# `frame-sink` is a debug consumer, standing in for `perception`: it reads the
+# frame in place and logs it, and it also gives `camera` a subscriber so the
+# shared-memory path is actually exercised.
 nodes:
   - id: robotd-state
     path: ../target/debug/dora-robotd-state
@@ -24,6 +33,19 @@ nodes:
       - joint_state
       - odom
       - imu
+
+  - id: camera
+    path: ../target/debug/dora-camera
+    inputs:
+      tick: dora/timer/millis/33
+    outputs:
+      - image
+    shared_memory_pool_size: 64MB
+
+  - id: frame-sink
+    path: ../target/debug/dora-frame-sink
+    inputs:
+      image: camera/image
 
   - id: keyboard
     path: ../target/debug/dora-keyboard

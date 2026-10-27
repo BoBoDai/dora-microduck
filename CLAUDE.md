@@ -46,7 +46,7 @@ dora graph dataflows/sim.yml --mermaid
 - `dora run` starts an isolated local daemon and exits once the dataflow stops; `dora up` is not needed.
 - Per-run logs and the session file land in `dataflows/out/`, which is gitignored.
 - `cargo test --workspace` runs the keyboard parser tests; target one crate with `cargo test -p dora-keyboard`.
-- `dora run dataflows/sim.yml --stop-after 4` without `ROBOTD_SOCKET` is a graph-only smoke test: `robotd-state` logs that no state will be published, the wrapper logs one `cmd_vel … (no ROBOTD_SOCKET)` line, and without a controlling terminal the keyboard logs "keyboard disabled" and publishes zeros. That is expected. The real end-to-end test is `scripts/dora-sim run --stop-after 5`, which should show `dora-robotd-state: subscribed to …` and `published N robot states`, then stop the twin cleanly.
+- `dora run dataflows/sim.yml --stop-after 4` without `ROBOTD_SOCKET`/`MEDIA_FRAME_SOCKET` is a graph-only smoke test: `robotd-state` logs that no state will be published, `camera` logs that no frames will be published, the wrapper logs one `cmd_vel … (no ROBOTD_SOCKET)` line, and without a controlling terminal the keyboard logs "keyboard disabled" and publishes zeros. That is expected. The real end-to-end test is `scripts/dora-sim run --stop-after 5`, which should show `dora-robotd-state: subscribed to …` and `published N robot states`, then stop the twin cleanly. Add `DUCK_SIM_CAMERAS=a` to exercise `dora-camera`; that path needs GStreamer, and `duck-sim` refuses to start a camera without it.
 - `scripts/dora-sim run` is the end-to-end launcher test: it should print "standing", connect the wrapper to `target/duck-sim/state/duck-a.sock`, run the dataflow, then "stopping the MuJoCo twin" with no leftover processes.
 
 ## Architecture
@@ -62,22 +62,28 @@ dora graph dataflows/sim.yml --mermaid
 
 - `crates/dora-keyboard` — reads keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. Hold to move: W/S vx, A/D vy, Q/E yaw; X stops immediately. Terminals report no key-up, so a key is held while it repeats — the first window is 800 ms to cover the OS repeat delay, then 250 ms once repeats are flowing. Each axis times out on its own: a key on one axis must not keep another axis's last value alive. Ctrl-C quits and restores the terminal, then signals dora's process group so one press stops the dataflow. Arrow and space sequences are swallowed on purpose — the MuJoCo viewer binds them to stepping and pausing. The parser consumes whole escape sequences (CSI with parameters, SS3, `ESC`+key) rather than one byte after `ESC [`, because a stray final `D` would strafe. dora can spawn the node in a background process group, so it claims the tty's foreground group and restores it on exit; `first key received` in the node log confirms input works. Defaults are 0.30 forward, 0.40 backward, 0.50 strafe and 1.50 yaw: every axis has a deadband (about 0.25 m/s forward, 0.30–0.35 backward, ~0.4 m/s strafe), and below ~1.2 rad/s it barely yaws, so smaller "gentle" values only wobble the duck. Backward needs more than forward: −0.30 moves nothing at all. Without a tty it warns and publishes zeros.
 - `crates/dora-robotd-state` — subscribes to `robot.subscribe` on `ROBOTD_SOCKET` and publishes the measured state on a 20 ms tick: `joint_state` (15 `f32`), `odom` (`[x, y, z, yaw]`) and `imu` (`[qw, qx, qy, qz, gx, gy, gz]`). A reader thread reconnects and resubscribes when robotd restarts; with `ROBOTD_SOCKET` unset it logs and publishes nothing.
+- `crates/dora-camera` — pulls `media.frame` on `MEDIA_FRAME_SOCKET` at 33 ms, writes the raw UYVY bytes straight into a dora sample (IPC header first, then `read_exact` into the sample's data region), and publishes `image` with `width`/`height`/`format`/`rotate` metadata. It installs a warn-level tracing subscriber so dora's own `zenoh direct path` / `daemon path` diagnostics are visible. With the socket unset it logs and publishes nothing.
+- `crates/dora-frame-sink` — debug consumer for `image`: reads the `UInt8Array` in place and logs every 30th frame. It exists to exercise the shared-memory path until `perception` replaces it.
 - `crates/dora-mujoco-bridge` — a deterministic synthetic gait over the 15 joints, retained as a graph-only stub. It is **not** in `dataflows/sim.yml`: the upstream twin already runs the real `robotd` against MuJoCo, and a second simulator in the graph would disagree with it.
 - `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It is a pure intent sink; state lives in `dora-robotd-state`.
 
 ### Dataflow
 
-`dataflows/sim.yml` has three nodes; the state and control paths are separate:
+`dataflows/sim.yml` has five nodes; the state, camera, and control paths are separate:
 
 ```
 keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd (ROBOTD_SOCKET)
 
 robotd ──robot.state──▶ robotd-state ──joint_state / odom / imu──▶ (behaviour nodes)
+
+mediad ──media.frame──▶ camera ──image (SHM)──▶ frame-sink (debug)
 ```
 
 - `path:` in the YAML is resolved **relative to the dataflow file's directory**, hence `../target/debug/<bin>`.
 - Payloads are **Arrow arrays of `f32`** via `IntoArrow` / `TryFrom<&ArrowData>`, not JSON. Joint count and order must come from `duck_ipc_proto::JOINT_NAMES`.
-- Both `robotd-state` and `robotd-wrapper` read `ROBOTD_SOCKET`; unset means no state and logged commands, not a failed dataflow.
+- Both `robotd-state` and `robotd-wrapper` read `ROBOTD_SOCKET`; `camera` reads `MEDIA_FRAME_SOCKET`. Unset means no state or no frames and logged commands, not a failed dataflow.
+- `camera` declares `shared_memory_pool_size: 64MB`; a 720p UYVY frame is ~2 MB in the sample (payload plus the UInt8 validity bitmap), so the default 8 MB pool would only hold a few frames.
+- `frame-sink` is a debug consumer, not part of the target architecture; `perception` replaces it.
 - The keyboard node needs a controlling terminal; `dora run` from a non-tty (CI, an agent shell) only exercises the zero-command path.
 
 ### Simulation launcher (A1)
@@ -87,7 +93,7 @@ robotd ──robot.state──▶ robotd-state ──joint_state / odom / imu─
 1. It extracts the MuJoCo body from `microduck_rl` (`origin/develop`, overridable with `MICRODUCK_RL_REF`) into `target/duck-sim/rl`, symlinks that checkout's `.venv`, and never modifies the other repository. Override the source checkout with `MICRODUCK_RL`.
 2. It starts the upstream `vendor/microduck/scripts/duck-sim`, which owns daemon build, policy fetch, params, sockets, health checks and standing.
 3. It turns terminal echo off first (`stty -g` saved, restored by the exit trap). The twin takes about ten seconds to come up, and the keyboard node does not exist until after that; without this, keys pressed while waiting are echoed by the driver as `^[[A`.
-4. It exports `ROBOTD_SOCKET` and runs `dora run` in the foreground.
+4. It exports `ROBOTD_SOCKET` and runs `dora run` in the foreground. With `DUCK_SIM_CAMERAS=a` it also exports `MEDIA_FRAME_SOCKET` for the simulated camera's `media.frame` socket; that option needs GStreamer, and the upstream launcher refuses to start a camera without it.
 5. On exit it runs `duck-sim down` **only if it started the twin**; an already-running twin is left alone.
 
 Do **not** turn the upstream daemons into dora nodes. `robotd` is binary-only and safety-critical; `btd`/`configd`/`updaterd` must survive a dead `robotd` and depend on systemd units and socket permissions. Dora owns the graph; systemd/upstream owns the daemons. The one seam worth taking over later is the MuJoCo body protocol from `duck_control::sim` (`hello/read/write/gain/torque/slow`, protocol 1).

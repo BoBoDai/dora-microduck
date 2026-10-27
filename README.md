@@ -12,6 +12,8 @@
 ├── Cargo.lock                  # workspace 级锁文件，提交
 ├── crates/
 │   ├── dora-robotd-state/      # robot.subscribe → joint_state / odom / imu
+│   ├── dora-camera/            # media.frame → image（SHM）
+│   ├── dora-frame-sink/        # 调试消费者：原地读 image，不拷贝
 │   ├── dora-robotd-wrapper/    # cmd_vel → robot.move
 │   ├── dora-keyboard/          # 终端键盘 → cmd_vel
 │   └── dora-mujoco-bridge/     # 合成关节状态 stub（不在 sim.yml 中使用）
@@ -42,6 +44,14 @@ dora --version   # dora-cli 1.1.0
 cargo install dora-cli --version 1.1.0 --locked
 ```
 
+**可选：模拟相机。** 只有 `DUCK_SIM_CAMERAS=a` 时才需要 GStreamer。macOS：
+
+```bash
+brew install gstreamer libnice-gstreamer
+```
+
+板子上由 `scripts/setup-gstreamer.sh` 安装。没有 GStreamer 时数据流照常运行，只是 `camera` 节点拿不到帧。
+
 ## 初始化
 
 克隆时一并拉取子模块（普通 `git clone` 不会拉，`vendor/microduck` 会是空目录）：
@@ -63,6 +73,7 @@ git submodule update --init --recursive
 ```bash
 scripts/dora-sim                  # 启动 twin → 跑 dora 数据流 → 退出时关闭 twin
 scripts/dora-sim run --stop-after 5
+DUCK_SIM_CAMERAS=a scripts/dora-sim   # 同时启动模拟相机（需要 GStreamer）
 scripts/dora-sim up               # 只启动 twin，保持运行
 scripts/dora-sim status           # health / 50 Hz / standing
 scripts/dora-sim drive 0.3        # 向前走 8 秒
@@ -72,6 +83,7 @@ scripts/dora-sim down             # 关闭 twin
 
 - `run` 必须在前台终端执行：键盘节点读 `/dev/tty`，dora 给节点的 stdin 是 null
 - 脚本会自动设置 `ROBOTD_SOCKET=target/duck-sim/state/duck-a.sock`：`cmd_vel` 直接进模拟的 robotd，`robotd-state` 也从这里订阅状态
+- 启用模拟相机时，脚本还会设置 `MEDIA_FRAME_SOCKET=target/duck-sim/state/duck-a-frame.sock`；没启用时 `camera` 节点打印 `camera disabled`，其余图照常运行
 - MuJoCo body 从 `microduck_rl` 的 `origin/develop` 提取到 `target/duck-sim/rl`（不修改那个仓库）；可用 `MICRODUCK_RL`、`MICRODUCK_RL_REF`、`DUCK_SIM_DUCK` 覆盖
 - 如果 twin 已经在运行，`run` 会复用它，退出时也不会关掉它；只有本次启动的才会在退出时 `down`
 
@@ -90,9 +102,11 @@ dora run dataflows/sim.yml
 keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd（设置 ROBOTD_SOCKET 时）
 
 robotd ──robot.state（订阅）──▶ robotd-state ──joint_state / odom / imu──▶（行为节点）
+
+mediad ──media.frame──▶ camera ──image（SHM）──▶ frame-sink（调试消费者）
 ```
 
-`robotd-state` 通过 `ROBOTD_SOCKET` 发 `robot.subscribe`，把真实的关节角、里程计和 IMU 发布进图；未设置 socket 时它打印 `no state will be published`，数据流仍然运行。`keyboard` 的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 socket 时只打印日志。上游 twin 已经在跑真 `robotd` + MuJoCo，图里没有第二个仿真器。
+`robotd-state` 通过 `ROBOTD_SOCKET` 发 `robot.subscribe`，把真实的关节角、里程计和 IMU 发布进图；未设置 socket 时它打印 `no state will be published`，数据流仍然运行。`camera` 通过 `MEDIA_FRAME_SOCKET` 拉取 `media.frame` 的原始 UYVY 帧，直接写进 dora 的 SHM sample；`frame-sink` 是临时调试消费者，原地读 `Uint8Array`，下一步会被 `perception` 替换。`keyboard` 的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 socket 时只打印日志。上游 twin 已经在跑真 `robotd` + MuJoCo，图里没有第二个仿真器。
 
 ## 键盘遥操作
 
@@ -132,25 +146,28 @@ robotd ──robot.state（订阅）──▶ robotd-state ──joint_state / o
 
 默认前进 vx 取 0.30，是因为这套 MuJoCo 模型在 0.25 m/s 以下基本不走（实测 0.20 三秒只移动 1 mm）。后退的死区更高：-0.30 完全不动，-0.35 起才稳定迈步，所以 S 取 -0.40 留出余量；这也是“站着按 S 不动”的原因。
 
-要真正驱动 robotd 并读到状态：
+要真正驱动 robotd、读到状态并拿到相机帧：
 
 ```bash
 export ROBOTD_SOCKET=/path/to/duck-a.sock
+export MEDIA_FRAME_SOCKET=/run/mediad/media.sock   # 真机
 dora run dataflows/sim.yml
 ```
 
-`robotd-wrapper` 和 `robotd-state` 都读这个变量：前者发 `robot.move`，后者订阅 `robot.state`。
+`robotd-wrapper` 和 `robotd-state` 都读 `ROBOTD_SOCKET`：前者发 `robot.move`，后者订阅 `robot.state`。`camera` 读 `MEDIA_FRAME_SOCKET`；不设置时它只打印 `no frames will be published`。
 
 ## 当前状态
 
-四个节点都能构建、能跑通数据流。控制链和状态链现在都是真的：
+数据流的五个节点都能构建、能跑通。控制链、状态链和相机数据面现在都是真的：
 
 - `dora-keyboard`：终端键盘已经可用（`/dev/tty` + termios raw mode）。
 - `dora-robotd-wrapper`：纯 intent sink，`cmd_vel` 转成 `robot.move` 发到 `ROBOTD_SOCKET`；不再镜像 `joint_state`。
 - `dora-robotd-state`：通过 `robot.subscribe` 订阅 `robot.state`，发布 `joint_state`（15 个关节）、`odom` 和 `imu`；robotd 重启后会自动重连。
-- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo 才是仿真来源。保留它是为了不依赖 robotd 的纯图测试。
+- `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，直接写进 SHM sample；`shared_memory_pool_size: 64MB`。已用假的 `media.frame` 服务验证过协议和 `zenoh direct path`；模拟相机需要 `DUCK_SIM_CAMERAS=a` 和 GStreamer。
+- `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；下一步由 `perception` 替换。
+- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo 才是仿真来源。
 
-下一步是感知与行为切片（`camera` → `perception` → `brain`），见 `docs/architecture.md` §4。
+下一步是 `perception` + `brain`：把 `image` 变成 `target_visible` / `target_bearing`，再输出 `cmd_vel`，见 `docs/architecture.md` §4。
 
 ## 关于 Cargo.lock
 

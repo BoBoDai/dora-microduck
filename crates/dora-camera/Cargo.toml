@@ -1,0 +1,14 @@
+[package]
+name = "dora-camera"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Dora node that pulls raw frames from mediad's media.frame endpoint"
+publish = false
+
+[dependencies]
+dora-node-api.workspace = true
+duck-ipc-proto.workspace = true
+eyre.workspace = true
+serde_json.workspace = true
+tracing-subscriber = "0.3"

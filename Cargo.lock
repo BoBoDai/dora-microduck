@@ -887,6 +887,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-camera"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "duck-ipc-proto",
+ "eyre",
+ "serde_json",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dora-core"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -912,6 +923,14 @@ dependencies = [
  "uuid",
  "which",
  "zenoh",
+]
+
+[[package]]
+name = "dora-frame-sink"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "eyre",
 ]
 
 [[package]]

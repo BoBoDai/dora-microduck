@@ -21,8 +21,9 @@
   socket client；感知没有通用数据面；自主大脑没有移植。
 - dora 插在 `robotd` 之上：节点图负责行为组合，Arrow + 共享内存负责大帧数据面，
   coordinator 负责生命周期。`robotd` 仍然是唯一电机权威，dora 不碰安全，也不进恢复路径。
-- 本仓库已经接通控制链和状态链：`keyboard → robotd-wrapper → robotd`，以及
-  `robotd → robotd-state → joint_state / odom / imu`。感知和行为节点还没开始。
+- 本仓库已经接通控制链、状态链和相机数据面：`keyboard → robotd-wrapper → robotd`、
+  `robotd → robotd-state → joint_state / odom / imu`，以及
+  `mediad → camera → image（SHM）→ frame-sink`。感知和行为节点还没开始。
 
 ## 1. 当前键盘控制
 
@@ -408,12 +409,18 @@ dora 提供：
 - `dora-robotd-state`：通过 `robot.subscribe` 订阅 `robot.state`，发布 `joint_state`（15 f32）、
   `odom`（`[x, y, z, yaw]`）和 `imu`（`[qw, qx, qy, qz, gx, gy, gz]`）；robotd 重启后自动
   重连并重新订阅。
+- `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，把 IPC 头和二进制尾部直接写进 sample，
+  发布 `image` 和 `width`/`height`/`format`/`rotate` 元数据；`shared_memory_pool_size: 64MB`。
+  已用假的 `media.frame` 服务验证协议和 `zenoh direct path`。
+- `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；下一步由 `perception`
+  替换。它的存在也让 camera 的输出有订阅者，从而真正走 SHM 路径。
 - `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo
   才是仿真来源。
-- `dataflows/sim.yml`：三条节点，状态链和控制链分离；假反馈环已删除。
-- `scripts/dora-sim`：负责 twin 生命周期、tty echo、`ROBOTD_SOCKET`、`dora run`。
+- `dataflows/sim.yml`：五个节点，状态链、相机数据面和控制链分离；假反馈环已删除。
+- `scripts/dora-sim`：负责 twin 生命周期、tty echo、`ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`、
+  `dora run`。
 
-也就是说：**控制链和状态链现在都是真的。** 缺的是感知和行为。
+也就是说：**控制链、状态链和相机数据面现在都是真的。** 缺的是感知和行为。
 
 ### 4.2 目标图
 
@@ -423,19 +430,22 @@ robotd-state ──joint_state / odom / imu──┐
 camera ──image──▶ perception ──target────┘
 ```
 
-`robotd-state` 已经是当前实现；`camera`、`perception`、`brain` 还是计划。
+`robotd-state` 和 `camera` 已经是当前实现；`perception` 和 `brain` 还是计划。当前
+`camera → frame-sink` 是调试替代，用来验证帧路径和 SHM。
 
 ### 4.3 分步
 
 1. **真状态（已完成）**：`dora-robotd-state` 订阅 `robot.subscribe`，发布 `joint_state`
    （15 f32）、`odom`、`imu`；`sim.yml` 的 `joint_state` 来源已换成它，`mujoco-bridge` 已从
    图中移除。不要在 dora 节点里重新实现 MuJoCo。
-2. **相机 + SHM（下一步）**：启动 sim 时 `DUCK_SIM_CAMERAS=a`；新增 `dora-camera`，按 30 Hz 调
-   `media.frame`，用 `send_output_raw` 把二进制尾部直接读进 sample；节点配
-   `shared_memory_pool_size: 64MB`。确认日志出现 `zenoh direct path`。
-3. **最小 perception + brain**：先不接 NPU/模型，做一个最笨的检测（颜色/亮度/运动），
-   输出 `target_visible`、`target_bearing`；`brain` 做反应式控制（可见则转向/前进，
-   丢失则停）。`robotd-wrapper` 仍是唯一 intent sink。
+2. **相机 + SHM（已完成）**：`dora-camera` 按 30 Hz 调 `media.frame`，用
+   `allocate_data_sample` + `encode_uint8_ipc_header` + `send_output_sample` 把二进制尾部
+   直接读进 sample；节点配 `shared_memory_pool_size: 64MB`。日志已确认
+   `output image: … B -> zenoh direct path` 和 `entering zenoh put of an SHM buffer`。
+   模拟相机需要 `DUCK_SIM_CAMERAS=a` 和 GStreamer；协议本身已用假 `media.frame` 服务验证。
+3. **最小 perception + brain（下一步）**：先不接 NPU/模型，做一个最笨的检测
+   （颜色/亮度/运动），输出 `target_visible`、`target_bearing`；`brain` 做反应式控制
+   （可见则转向/前进，丢失则停）。`robotd-wrapper` 仍是唯一 intent sink。
 4. **管理**：YAML 加 `restart_policy: on-failure`、`startup_timeout`、
    `health_check_timeout`；切片稳定后再加 `dora up` + `scripts/dora-sim managed`。
 5. **之后**：16 状态大脑、NPU 鸭子检测器、真机部署、板载资源测量。
@@ -444,7 +454,8 @@ camera ──image──▶ perception ──target────┘
 
 - `joint_state` / `odom` 来自真实 `robot.state`，不再是合成步态；smoke test 的首帧已是站立时
   的真实值（已完成）。
-- 相机帧（>4 KB）在日志里走 `zenoh direct path`，不是 `daemon path`。
+- 相机帧（>4 KB）在日志里走 `zenoh direct path`，不是 `daemon path`；已用假 `media.frame`
+  服务验证（已完成）。模拟相机本身还需要 GStreamer。
 - 目标进入视野时鸭子转向/前进，目标丢失时停下。
 - brain 被杀掉时，`robotd` 的 deadman 让鸭子停下；如果加了 restart policy，brain 能回来。
 - `dora node list` 显示所有节点健康。
@@ -455,9 +466,11 @@ camera ──image──▶ perception ──target────┘
 
 - `crates/dora-keyboard/src/main.rs`：键盘解析、raw mode、hold 计时、测试。
 - `crates/dora-robotd-state/src/main.rs`：`robot.subscribe` → `joint_state` / `odom` / `imu`。
+- `crates/dora-camera/src/main.rs`：`media.frame` → `image`，二进制尾部直接读进 sample。
+- `crates/dora-frame-sink/src/main.rs`：调试消费者，原地读 `Uint8Array`。
 - `crates/dora-robotd-wrapper/src/main.rs`：`cmd_vel` → `robot.move`。
 - `crates/dora-mujoco-bridge/src/main.rs`：合成步态 stub（不在 `sim.yml` 中）。
-- `dataflows/sim.yml`：三条节点和 tick。
+- `dataflows/sim.yml`：五个节点和各自的 tick。
 - `scripts/dora-sim`：twin 生命周期和 `ROBOTD_SOCKET`。
 - `README.md`、`CLAUDE.md`：命令、版本耦合、约定。
 

@@ -4,6 +4,7 @@
 #
 #   scripts/dora-sim                 # start the twin, run the dataflow, stop it
 #   scripts/dora-sim run --stop-after 5
+#   DUCK_SIM_CAMERAS=a scripts/dora-sim   # also start the simulated camera
 #   scripts/dora-sim up              # start the twin and leave it
 #   scripts/dora-sim status          # health + loop rate
 #   scripts/dora-sim drive 0.3       # walk forward for 8 s
@@ -126,12 +127,29 @@ cmd_run() {
     command -v dora >/dev/null || die "dora CLI not found; cargo install dora-cli --version 1.1.0"
 
     say "building the dora nodes"
-    ( cd "$ROOT" && cargo build --quiet -p dora-keyboard -p dora-robotd-wrapper -p dora-robotd-state )
+    ( cd "$ROOT" && cargo build --quiet -p dora-keyboard -p dora-robotd-wrapper -p dora-robotd-state -p dora-camera -p dora-frame-sink )
 
     tty_save
 
+    # `camera` reads media.frame from this socket. A twin started earlier with
+    # DUCK_SIM_CAMERAS has one already; a twin about to start with it will
+    # create one. Without either, the node stays quiet and the rest of the graph
+    # runs.
+    if [ -z "${MEDIA_FRAME_SOCKET:-}" ]; then
+        if [ -n "${DUCK_SIM_CAMERAS:-}" ] || [ -S "$STATE/$DUCK-frame.sock" ]; then
+            MEDIA_FRAME_SOCKET="$STATE/$DUCK-frame.sock"
+            export MEDIA_FRAME_SOCKET
+            say "camera frame socket: $MEDIA_FRAME_SOCKET"
+        else
+            say "camera disabled (set DUCK_SIM_CAMERAS=a to enable the simulated camera)"
+        fi
+    fi
+
     if is_up; then
         say "using the running twin at $SOCK"
+        if [ -n "${MEDIA_FRAME_SOCKET:-}" ] && [ ! -S "$MEDIA_FRAME_SOCKET" ]; then
+            say "warning: no frame socket at $MEDIA_FRAME_SOCKET; restart the twin with DUCK_SIM_CAMERAS=a"
+        fi
     else
         start_sim
         STARTED=1

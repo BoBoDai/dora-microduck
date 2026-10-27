@@ -1,0 +1,11 @@
+[package]
+name = "dora-frame-sink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Debug consumer that reads camera frames without copying them"
+publish = false
+
+[dependencies]
+dora-node-api = { workspace = true, features = ["arrow-v59"] }
+eyre.workspace = true

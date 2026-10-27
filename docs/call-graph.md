@@ -51,6 +51,7 @@ flowchart TB
     wrapper["robotd-wrapper"]
     state["robotd-state"]
     camera["camera"]
+    sink["frame-sink（调试）"]
     percep["perception"]
     brain["brain"]
   end
@@ -75,7 +76,8 @@ flowchart TB
   state -.->|"joint_state / odom / imu"| brain
   camera -->|"media.frame 请求"| mediad
   mediad ==>|"header + UYVY 字节"| camera
-  camera ==>|"image（≥4 KB，SHM）"| percep
+  camera ==>|"image（SHM）"| sink
+  camera -.->|"image（计划）"| percep
   percep -->|"target"| brain
   brain -->|"cmd_vel（计划）"| wrapper
 
@@ -92,7 +94,7 @@ flowchart TB
   systemd -.->|"start / stop / restart"| daemons
 
   classDef planned stroke-dasharray: 5 5,stroke:#999,fill:#f6f6f6;
-  class camera,percep,brain planned;
+  class percep,brain planned;
 ```
 
 读法：
@@ -164,11 +166,13 @@ flowchart TD
   S2 -.-> B["dora brain（计划）"]
 ```
 
-图里没有画出来、但在同一层发生的两件事：
+图里没有画出来、但在同一层发生的三件事：
 
 - `dora-mujoco-bridge` 仍是确定性合成步态的独立 stub，已不在 `sim.yml` 中；`sim.yml` 的
   `joint_state` 来自 `robotd-state` 的真实 `robot.state` 订阅。键盘节点和 wrapper 之间的
   `cmd_vel` 是 Arrow `f32[3]`，每 50 ms 一条；dora 的 daemon/zenoh 负责路由，不改变命令语义。
+- 相机路径是独立的一条：`mediad → camera → image → frame-sink`，不经过 `robotd`，也不在
+  上面这张控制流程图里；`frame-sink` 是调试消费者，`perception` 会替换它。
 
 ## 3. 一次控制的时序
 
@@ -181,8 +185,9 @@ sequenceDiagram
   participant W as robotd-wrapper（dora，当前）
   participant R as robotd
   participant S as robotd-state
-  participant C as camera（计划）
+  participant C as camera（当前）
   participant M as mediad
+  participant F as frame-sink（调试）
   participant P as perception（计划）
   participant B as brain（计划）
 
@@ -192,7 +197,8 @@ sequenceDiagram
   S-->>B: joint_state / odom / imu
   C->>M: media.frame（请求一帧）
   M-->>C: JSON header + UYVY 字节（约 1.8 MiB）
-  C-->>P: image（≥4 KB，SHM 零拷贝）
+  C-->>F: image（SHM 零拷贝，当前）
+  C-->>P: image（计划）
   P-->>B: target_visible / target_bearing
   B->>W: cmd_vel（行为层 intent，计划）
 
@@ -208,8 +214,10 @@ sequenceDiagram
   客户端轮询。
 - `media.frame` 是 **按需拉取**：请求登记后等下一帧，不是读缓存；一帧约 1.8 MiB，JSON 头
   之后紧跟原始 UYVY 字节。
-- 大帧进入 dora 图后走 SHM（≥4096 B、同机、池子有空间），`send_output_raw` 是 0 拷贝，
-  `send_output` 是 1 拷贝，接收端 0 拷贝。
+- 大帧进入 dora 图后走 SHM（≥4096 B、同机、池子有空间）。`camera` 用
+  `allocate_data_sample` + `encode_uint8_ipc_header` + `send_output_sample` 把二进制尾部
+  直接读进 sample，效果等同于 `send_output_raw` 的 0 拷贝路径；接收端 `values()` 直接
+  alias 那块内存。`send_output`（Arrow 数组）则是 1 拷贝。
 
 ## 4. 调用关系表
 
@@ -230,8 +238,9 @@ sequenceDiagram
 | dora `keyboard` | `robotd-wrapper` | `cmd_vel` Arrow `f32[3]` | dora 消息 |
 | dora `robotd-wrapper` | `robotd` | `robot.move` | notification |
 | `robotd` | dora `robotd-state` | `robot.state` | 订阅推送 |
-| dora `camera`（计划） | `mediad` | `media.frame` | 请求 + 二进制 |
-| dora `camera`（计划） | `perception`（计划） | `image`（原始字节） | dora 消息（SHM） |
+| dora `camera` | `mediad` | `media.frame` | 请求 + 二进制 |
+| dora `camera` | dora `frame-sink`（调试） | `image`（原始字节） | dora 消息（SHM） |
+| dora `camera` | `perception`（计划） | `image`（原始字节） | dora 消息（SHM，计划） |
 | `perception`（计划） | `brain`（计划） | `target_visible` / `target_bearing` | dora 消息 |
 | `brain` | `robotd-wrapper` | `cmd_vel` | dora 消息（计划） |
 | `updaterd` | `robotd` | `robot.health` | 请求/响应 |
