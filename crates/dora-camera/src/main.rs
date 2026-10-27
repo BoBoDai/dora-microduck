@@ -2,8 +2,10 @@
 //!
 //! `mediad` owns the camera and serves a local, on-demand raw frame socket:
 //! a JSON-RPC request is answered by a `MediaFrameHeader` line followed by
-//! exactly `bytes` raw UYVY bytes. This node asks for one frame per 33 ms tick
-//! and republishes it as an Arrow `UInt8` array.
+//! exactly `bytes` raw UYVY bytes. **One frame per connection**: the server
+//! closes after writing the payload, so this node connects again for the next
+//! tick. This node asks for one frame per 33 ms tick and republishes it as an
+//! Arrow `UInt8` array.
 //!
 //! The payload is written **directly into the dora sample**: the Arrow IPC
 //! header is encoded into the sample first, then the socket's binary tail is
@@ -39,6 +41,7 @@ struct FrameSource {
     stream: Option<UnixStream>,
     next_id: u64,
     failures: u32,
+    connections: u64,
 }
 
 impl FrameSource {
@@ -52,6 +55,7 @@ impl FrameSource {
             stream: None,
             next_id: 0,
             failures: 0,
+            connections: 0,
         }
     }
 
@@ -59,9 +63,15 @@ impl FrameSource {
         let path = self.path.clone().expect("next_frame checks the path");
         let stream = UnixStream::connect(&path)
             .wrap_err_with(|| format!("connect to mediad at {}", path.display()))?;
+        // `media.frame` serves one frame per connection and then closes, so a
+        // normal 30 fps stream reconnects 30 times a second. Say so once, and
+        // again only after a real failure; otherwise the log is unreadable.
+        if self.connections == 0 || self.failures > 0 {
+            eprintln!("dora-camera: connected to {}", path.display());
+        }
         self.stream = Some(stream);
         self.failures = 0;
-        eprintln!("dora-camera: connected to {}", path.display());
+        self.connections += 1;
         Ok(())
     }
 
@@ -234,6 +244,11 @@ fn main() -> Result<()> {
                     Parameter::String(FRAMING_ARROW_IPC.to_owned()),
                 );
                 node.send_output_sample(DataId::from(IMAGE.to_owned()), parameters, Some(sample))?;
+
+                // `media.frame` answers one frame per connection and returns.
+                // Drop it now so the next request starts on a fresh socket
+                // instead of writing into a closed one.
+                source.disconnect();
 
                 published += 1;
                 if published == 1 || published.is_multiple_of(30) {

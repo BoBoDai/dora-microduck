@@ -216,8 +216,9 @@ struct Hold {
 - 数据面：帧不经过 socket。如果帧必须跨进程，最后手段是共享内存（shm/dmabuf ring buffer），
   socket 只传“第 N 帧在 offset …”这样的元数据。
 - 现成的大帧入口：`media.frame`，在 `/run/mediad/media.sock` 上。一次请求返回 JSON 头 +
-  原始 UYVY 字节（640×480 约 1.8 MiB）。它是**按需拉取**：请求登记后等下一帧，不是缓存
-  最后一帧。这是给本机 recorder/perception 进程用的，不是 WebRTC 控制通道。
+  原始 UYVY 字节（默认 720p30 约 1.8 MiB；仿真的 360p30 约 460 KB）。它是**按需拉取**：
+  请求登记后等下一帧，不是缓存最后一帧；而且**一个连接只返回一帧**，客户端下一条请求要
+  重新连接。这是给本机 recorder/perception 进程用的，不是 WebRTC 控制通道。
 - `tofd` 的 8×8 深度帧在 `/run/tofd/tof.sock`，15 Hz，独立订阅。
 
 ### 2.4 仿真
@@ -440,9 +441,11 @@ camera ──image──▶ perception ──target────┘
    图中移除。不要在 dora 节点里重新实现 MuJoCo。
 2. **相机 + SHM（已完成）**：`dora-camera` 按 30 Hz 调 `media.frame`，用
    `allocate_data_sample` + `encode_uint8_ipc_header` + `send_output_sample` 把二进制尾部
-   直接读进 sample；节点配 `shared_memory_pool_size: 64MB`。日志已确认
+   直接读进 sample；节点配 `shared_memory_pool_size: 64MB`。已在本机装好 GStreamer 并跑通
+   模拟相机：640×360 UYVY（`360p30`），约 460 KB/帧，日志确认
    `output image: … B -> zenoh direct path` 和 `entering zenoh put of an SHM buffer`。
-   模拟相机需要 `DUCK_SIM_CAMERAS=a` 和 GStreamer；协议本身已用假 `media.frame` 服务验证。
+   `media.frame` 每个连接只返回一帧，所以节点每个 tick 重连一次（只在首连/失败后打印）；
+   协议本身也已用假 `media.frame` 服务单独验证。
 3. **最小 perception + brain（下一步）**：先不接 NPU/模型，做一个最笨的检测
    （颜色/亮度/运动），输出 `target_visible`、`target_bearing`；`brain` 做反应式控制
    （可见则转向/前进，丢失则停）。`robotd-wrapper` 仍是唯一 intent sink。

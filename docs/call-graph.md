@@ -212,8 +212,9 @@ sequenceDiagram
   决定是否执行。
 - `robot.state` 是 **订阅推送**：连接建立后 `robotd` 按 50 Hz 推（可用 `hz` 降频），不是
   客户端轮询。
-- `media.frame` 是 **按需拉取**：请求登记后等下一帧，不是读缓存；一帧约 1.8 MiB，JSON 头
-  之后紧跟原始 UYVY 字节。
+- `media.frame` 是 **按需拉取**：请求登记后等下一帧，不是读缓存；默认 720p30 一帧约
+  1.8 MiB（仿真 `360p30` 约 460 KB），JSON 头之后紧跟原始 UYVY 字节。**一个连接只返回
+  一帧**，所以 `camera` 每个 tick 都会重连，只打印首连和恢复。
 - 大帧进入 dora 图后走 SHM（≥4096 B、同机、池子有空间）。`camera` 用
   `allocate_data_sample` + `encode_uint8_ipc_header` + `send_output_sample` 把二进制尾部
   直接读进 sample，效果等同于 `send_output_raw` 的 0 拷贝路径；接收端 `values()` 直接
