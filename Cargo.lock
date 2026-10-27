@@ -1012,11 +1012,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "dora-robotd-wrapper"
+name = "dora-robotd-state"
 version = "0.1.0"
 dependencies = [
  "dora-node-api",
  "duck-ipc-proto",
+ "eyre",
+ "serde_json",
+]
+
+[[package]]
+name = "dora-robotd-wrapper"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
  "eyre",
  "serde_json",
 ]

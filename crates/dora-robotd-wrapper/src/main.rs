@@ -1,22 +1,20 @@
-//! Bridges `robotd` into the dora dataflow.
+//! Turns `cmd_vel` into a `robot.move` notification on `robotd`'s unix socket.
 //!
-//! `cmd_vel` from the keyboard node becomes a `robot.move` notification on the
-//! daemon's unix socket. With no `ROBOTD_SOCKET` in the environment the command
-//! is only logged, which is what the synthetic `dataflows/sim.yml` stub wants;
-//! the real twin sets it to the simulated duck's socket.
+//! The keyboard node publishes `[vx, vy, vyaw]` at 20 Hz; this node forwards
+//! each one as a JSON-RPC notification (no `id`, no reply). With no
+//! `ROBOTD_SOCKET` in the environment the command is only logged, which is what
+//! a dataflow without a running daemon wants.
 //!
-//! The `joint_state` mirror is still here for the stub dataflow. Once dora owns
-//! the simulator, this node is where its state stream will be published too.
+//! State and perception are separate nodes: `dora-robotd-state` owns the
+//! `robot.state` subscription, and this node stays a pure intent sink.
 
-use dora_node_api::{DoraNode, Event, IntoArrow, dora_core::config::DataId};
+use dora_node_api::{DoraNode, Event};
 use eyre::{Result, WrapErr, eyre};
 use serde_json::json;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-const JOINT_STATE_IN: &str = "joint_state";
-const JOINT_COMMAND_OUT: &str = "joint_command";
 const CMD_VEL_IN: &str = "cmd_vel";
 
 struct RobotdLink {
@@ -88,39 +86,17 @@ impl RobotdLink {
 }
 
 fn main() -> Result<()> {
-    let (mut node, mut events) = DoraNode::init_from_env()?;
+    // Keep the node alive for the life of the dataflow; this node has no
+    // outputs of its own and sends its commands over the robotd socket.
+    let (_node, mut events) = DoraNode::init_from_env()?;
     let mut robotd = RobotdLink::from_env();
-    let mut forwarded = 0_u64;
 
     while let Some(event) = events.recv() {
-        let Event::Input { id, metadata, data } = event else {
+        let Event::Input { id, data, .. } = event else {
             continue;
         };
 
         match id.as_str() {
-            JOINT_STATE_IN => {
-                let positions: Vec<f32> = (&data).try_into()?;
-                let expected = duck_ipc_proto::JOINT_NAMES.len();
-                if positions.len() != expected {
-                    return Err(eyre!(
-                        "expected {expected} joint positions, got {}",
-                        positions.len()
-                    ));
-                }
-
-                // TODO: send `positions` to robotd and use the command it reports back.
-                // Until then mirror the state so the simulated loop keeps ticking.
-                node.send_output(
-                    DataId::from(JOINT_COMMAND_OUT.to_owned()),
-                    metadata.parameters,
-                    positions.into_arrow(),
-                )?;
-
-                forwarded += 1;
-                if forwarded.is_multiple_of(100) {
-                    eprintln!("forwarded {forwarded} joint states ({expected} joints each)");
-                }
-            }
             CMD_VEL_IN => {
                 let command: Vec<f32> = (&data).try_into()?;
                 if command.len() != 3 {

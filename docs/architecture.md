@@ -21,8 +21,8 @@
   socket client；感知没有通用数据面；自主大脑没有移植。
 - dora 插在 `robotd` 之上：节点图负责行为组合，Arrow + 共享内存负责大帧数据面，
   coordinator 负责生命周期。`robotd` 仍然是唯一电机权威，dora 不碰安全，也不进恢复路径。
-- 本仓库目前只完成了“键盘 → cmd_vel → robot.move”这条最小链；`joint_state` 还是占位环，
-  尚未订阅 `robot.state`。
+- 本仓库已经接通控制链和状态链：`keyboard → robotd-wrapper → robotd`，以及
+  `robotd → robotd-state → joint_state / odom / imu`。感知和行为节点还没开始。
 
 ## 1. 当前键盘控制
 
@@ -41,8 +41,8 @@ dora/timer/millis/50 ──tick──▶ keyboard ──cmd_vel──▶ robotd-
 
   没有 `id`，不需要回复。`ROBOTD_SOCKET` 未设置时，wrapper 只在命令变化时打印日志。
 - 连接断了会重连一次，覆盖 `robotd` 重启后旧连接失效的场景。
-- `joint_state` / `joint_command` 目前是与 `mujoco-bridge` 的占位环，不是 `robotd` 的真实
-  状态，见 §4。
+- `joint_state` / `odom` / `imu` 来自 `dora-robotd-state` 的 `robot.subscribe`；不再是
+  `mujoco-bridge` 的占位环，见 §4。
 
 ### 1.2 为什么读 `/dev/tty`
 
@@ -404,29 +404,33 @@ dora 提供：
 ### 4.1 现状
 
 - `dora-keyboard`：真实可用，细节见 §1。
-- `dora-robotd-wrapper`：`cmd_vel` → `robot.move` 真实可用；`joint_state` 仍然是原样回传的
-  占位实现，没有订阅 `robot.state`。
-- `dora-mujoco-bridge`：没有 MuJoCo 绑定，用确定性合成步态发布 `joint_state`。
-- `dataflows/sim.yml`：三条节点 + 一个占位的反馈环；真实 `robotd` 的状态没有被 dora 消费。
+- `dora-robotd-wrapper`：纯 intent sink，`cmd_vel` → `robot.move` 真实可用。
+- `dora-robotd-state`：通过 `robot.subscribe` 订阅 `robot.state`，发布 `joint_state`（15 f32）、
+  `odom`（`[x, y, z, yaw]`）和 `imu`（`[qw, qx, qy, qz, gx, gy, gz]`）；robotd 重启后自动
+  重连并重新订阅。
+- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo
+  才是仿真来源。
+- `dataflows/sim.yml`：三条节点，状态链和控制链分离；假反馈环已删除。
 - `scripts/dora-sim`：负责 twin 生命周期、tty echo、`ROBOTD_SOCKET`、`dora run`。
 
-也就是说：**键盘到 robotd 的控制链是真的，反馈链是假的。** 上游 `duck-sim` 已经在跑真
-`robotd` + MuJoCo，但 dora 没有读它的状态。
+也就是说：**控制链和状态链现在都是真的。** 缺的是感知和行为。
 
 ### 4.2 目标图
 
 ```
-robotd-state ──joint_state / robot_state──┐
-                                          ├──▶ brain ──cmd_vel──▶ wrapper ──robot.move──▶ robotd
-camera ──image──▶ perception ──target─────┘
+robotd-state ──joint_state / odom / imu──┐
+                                         ├──▶ brain ──cmd_vel──▶ wrapper ──robot.move──▶ robotd
+camera ──image──▶ perception ──target────┘
 ```
+
+`robotd-state` 已经是当前实现；`camera`、`perception`、`brain` 还是计划。
 
 ### 4.3 分步
 
-1. **真状态**：新增 `dora-robotd-state`，`robot.subscribe`（可 `hz` 降频），发布
-   `joint_state`（15 f32）和 `robot_state`（odom/imu/safety/frames/skeleton）；替换
-   `mujoco-bridge` 的 `joint_state` 来源。不要在 dora 节点里重新实现 MuJoCo。
-2. **相机 + SHM**：启动 sim 时 `DUCK_SIM_CAMERAS=a`；新增 `dora-camera`，按 30 Hz 调
+1. **真状态（已完成）**：`dora-robotd-state` 订阅 `robot.subscribe`，发布 `joint_state`
+   （15 f32）、`odom`、`imu`；`sim.yml` 的 `joint_state` 来源已换成它，`mujoco-bridge` 已从
+   图中移除。不要在 dora 节点里重新实现 MuJoCo。
+2. **相机 + SHM（下一步）**：启动 sim 时 `DUCK_SIM_CAMERAS=a`；新增 `dora-camera`，按 30 Hz 调
    `media.frame`，用 `send_output_raw` 把二进制尾部直接读进 sample；节点配
    `shared_memory_pool_size: 64MB`。确认日志出现 `zenoh direct path`。
 3. **最小 perception + brain**：先不接 NPU/模型，做一个最笨的检测（颜色/亮度/运动），
@@ -438,7 +442,8 @@ camera ──image──▶ perception ──target─────┘
 
 ### 4.4 验收
 
-- `joint_state` 的数值随鸭子站立/行走变化，不再是合成步态。
+- `joint_state` / `odom` 来自真实 `robot.state`，不再是合成步态；smoke test 的首帧已是站立时
+  的真实值（已完成）。
 - 相机帧（>4 KB）在日志里走 `zenoh direct path`，不是 `daemon path`。
 - 目标进入视野时鸭子转向/前进，目标丢失时停下。
 - brain 被杀掉时，`robotd` 的 deadman 让鸭子停下；如果加了 restart policy，brain 能回来。
@@ -449,8 +454,9 @@ camera ──image──▶ perception ──target─────┘
 本仓库：
 
 - `crates/dora-keyboard/src/main.rs`：键盘解析、raw mode、hold 计时、测试。
-- `crates/dora-robotd-wrapper/src/main.rs`：`cmd_vel` → `robot.move`，占位的 `joint_state`。
-- `crates/dora-mujoco-bridge/src/main.rs`：合成步态。
+- `crates/dora-robotd-state/src/main.rs`：`robot.subscribe` → `joint_state` / `odom` / `imu`。
+- `crates/dora-robotd-wrapper/src/main.rs`：`cmd_vel` → `robot.move`。
+- `crates/dora-mujoco-bridge/src/main.rs`：合成步态 stub（不在 `sim.yml` 中）。
 - `dataflows/sim.yml`：三条节点和 tick。
 - `scripts/dora-sim`：twin 生命周期和 `ROBOTD_SOCKET`。
 - `README.md`、`CLAUDE.md`：命令、版本耦合、约定。

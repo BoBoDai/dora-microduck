@@ -8,6 +8,5 @@ publish = false
 
 [dependencies]
 dora-node-api.workspace = true
-duck-ipc-proto.workspace = true
 eyre.workspace = true
 serde_json.workspace = true

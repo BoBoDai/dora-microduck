@@ -126,7 +126,7 @@ cmd_run() {
     command -v dora >/dev/null || die "dora CLI not found; cargo install dora-cli --version 1.1.0"
 
     say "building the dora nodes"
-    ( cd "$ROOT" && cargo build --quiet -p dora-keyboard -p dora-robotd-wrapper -p dora-mujoco-bridge )
+    ( cd "$ROOT" && cargo build --quiet -p dora-keyboard -p dora-robotd-wrapper -p dora-robotd-state )
 
     tty_save
 

@@ -11,11 +11,15 @@
 ├── Cargo.toml                  # 虚拟 workspace：members = crates/*，exclude = vendor/microduck
 ├── Cargo.lock                  # workspace 级锁文件，提交
 ├── crates/
-│   ├── dora-robotd-wrapper/    # 把 robotd 接入 dora 图的节点
-│   ├── dora-keyboard/          # 终端键盘 → cmd_vel 节点
-│   └── dora-mujoco-bridge/     # MuJoCo 仿真节点
+│   ├── dora-robotd-state/      # robot.subscribe → joint_state / odom / imu
+│   ├── dora-robotd-wrapper/    # cmd_vel → robot.move
+│   ├── dora-keyboard/          # 终端键盘 → cmd_vel
+│   └── dora-mujoco-bridge/     # 合成关节状态 stub（不在 sim.yml 中使用）
 ├── dataflows/
 │   └── sim.yml                 # 仿真数据流定义
+├── docs/
+│   ├── architecture.md         # 键盘实现、上游架构与 dora 插入点
+│   └── call-graph.md           # 调用关系与调用流程
 ├── scripts/
 │   └── dora-sim                # 一键启动：MuJoCo twin + dora 数据流
 ├── vendor/
@@ -67,7 +71,7 @@ scripts/dora-sim down             # 关闭 twin
 ```
 
 - `run` 必须在前台终端执行：键盘节点读 `/dev/tty`，dora 给节点的 stdin 是 null
-- 脚本会自动设置 `ROBOTD_SOCKET=target/duck-sim/state/duck-a.sock`，`cmd_vel` 直接进模拟的 robotd
+- 脚本会自动设置 `ROBOTD_SOCKET=target/duck-sim/state/duck-a.sock`：`cmd_vel` 直接进模拟的 robotd，`robotd-state` 也从这里订阅状态
 - MuJoCo body 从 `microduck_rl` 的 `origin/develop` 提取到 `target/duck-sim/rl`（不修改那个仓库）；可用 `MICRODUCK_RL`、`MICRODUCK_RL_REF`、`DUCK_SIM_DUCK` 覆盖
 - 如果 twin 已经在运行，`run` 会复用它，退出时也不会关掉它；只有本次启动的才会在退出时 `down`
 
@@ -85,12 +89,10 @@ dora run dataflows/sim.yml
 ```
 keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd（设置 ROBOTD_SOCKET 时）
 
-dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-wrapper
-                              ▲                              │
-                              └──────── joint_command ───────┘
+robotd ──robot.state（订阅）──▶ robotd-state ──joint_state / odom / imu──▶（行为节点）
 ```
 
-`mujoco-bridge` 和 `robotd-wrapper` 构成反馈环：仿真节点发布关节状态，wrapper 返回 robotd 会下发的指令。`keyboard` 节点的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 `ROBOTD_SOCKET` 时只打印日志。
+`robotd-state` 通过 `ROBOTD_SOCKET` 发 `robot.subscribe`，把真实的关节角、里程计和 IMU 发布进图；未设置 socket 时它打印 `no state will be published`，数据流仍然运行。`keyboard` 的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 socket 时只打印日志。上游 twin 已经在跑真 `robotd` + MuJoCo，图里没有第二个仿真器。
 
 ## 键盘遥操作
 
@@ -130,20 +132,25 @@ dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-w
 
 默认前进 vx 取 0.30，是因为这套 MuJoCo 模型在 0.25 m/s 以下基本不走（实测 0.20 三秒只移动 1 mm）。后退的死区更高：-0.30 完全不动，-0.35 起才稳定迈步，所以 S 取 -0.40 留出余量；这也是“站着按 S 不动”的原因。
 
-要真正驱动 robotd：
+要真正驱动 robotd 并读到状态：
 
 ```bash
 export ROBOTD_SOCKET=/path/to/duck-a.sock
 dora run dataflows/sim.yml
 ```
 
+`robotd-wrapper` 和 `robotd-state` 都读这个变量：前者发 `robot.move`，后者订阅 `robot.state`。
+
 ## 当前状态
 
-这是骨架，三个节点都能构建、能跑通数据流，但关键的下游连接还在补：
+四个节点都能构建、能跑通数据流。控制链和状态链现在都是真的：
 
 - `dora-keyboard`：终端键盘已经可用（`/dev/tty` + termios raw mode）。
-- `dora-robotd-wrapper`：`cmd_vel` 已经能转成 `robot.move` 发到 `ROBOTD_SOCKET`；`joint_state` 仍然是原样回传的占位实现（见 `src/main.rs` 中的 `TODO`），尚未订阅 robotd 的真实状态流。
-- `dora-mujoco-bridge`：还没有引入 MuJoCo 绑定，目前用一个确定性的合成步态代替仿真。
+- `dora-robotd-wrapper`：纯 intent sink，`cmd_vel` 转成 `robot.move` 发到 `ROBOTD_SOCKET`；不再镜像 `joint_state`。
+- `dora-robotd-state`：通过 `robot.subscribe` 订阅 `robot.state`，发布 `joint_state`（15 个关节）、`odom` 和 `imu`；robotd 重启后会自动重连。
+- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo 才是仿真来源。保留它是为了不依赖 robotd 的纯图测试。
+
+下一步是感知与行为切片（`camera` → `perception` → `brain`），见 `docs/architecture.md` §4。
 
 ## 关于 Cargo.lock
 

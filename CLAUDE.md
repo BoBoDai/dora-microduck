@@ -46,7 +46,7 @@ dora graph dataflows/sim.yml --mermaid
 - `dora run` starts an isolated local daemon and exits once the dataflow stops; `dora up` is not needed.
 - Per-run logs and the session file land in `dataflows/out/`, which is gitignored.
 - `cargo test --workspace` runs the keyboard parser tests; target one crate with `cargo test -p dora-keyboard`.
-- `dora run dataflows/sim.yml --stop-after 4` is the quick end-to-end smoke test: expect "stepped N times over 15 joints" and "forwarded N joint states (15 joints each)", then all three nodes finishing successfully. Without a controlling terminal the keyboard node logs "keyboard disabled" and publishes zeros; that is the expected non-interactive result.
+- `dora run dataflows/sim.yml --stop-after 4` without `ROBOTD_SOCKET` is a graph-only smoke test: `robotd-state` logs that no state will be published, the wrapper logs one `cmd_vel … (no ROBOTD_SOCKET)` line, and without a controlling terminal the keyboard logs "keyboard disabled" and publishes zeros. That is expected. The real end-to-end test is `scripts/dora-sim run --stop-after 5`, which should show `dora-robotd-state: subscribed to …` and `published N robot states`, then stop the twin cleanly.
 - `scripts/dora-sim run` is the end-to-end launcher test: it should print "standing", connect the wrapper to `target/duck-sim/state/duck-a.sock`, run the dataflow, then "stopping the MuJoCo twin" with no leftover processes.
 
 ## Architecture
@@ -61,24 +61,23 @@ dora graph dataflows/sim.yml --mermaid
 ### Nodes
 
 - `crates/dora-keyboard` — reads keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. Hold to move: W/S vx, A/D vy, Q/E yaw; X stops immediately. Terminals report no key-up, so a key is held while it repeats — the first window is 800 ms to cover the OS repeat delay, then 250 ms once repeats are flowing. Each axis times out on its own: a key on one axis must not keep another axis's last value alive. Ctrl-C quits and restores the terminal, then signals dora's process group so one press stops the dataflow. Arrow and space sequences are swallowed on purpose — the MuJoCo viewer binds them to stepping and pausing. The parser consumes whole escape sequences (CSI with parameters, SS3, `ESC`+key) rather than one byte after `ESC [`, because a stray final `D` would strafe. dora can spawn the node in a background process group, so it claims the tty's foreground group and restores it on exit; `first key received` in the node log confirms input works. Defaults are 0.30 forward, 0.40 backward, 0.50 strafe and 1.50 yaw: every axis has a deadband (about 0.25 m/s forward, 0.30–0.35 backward, ~0.4 m/s strafe), and below ~1.2 rad/s it barely yaws, so smaller "gentle" values only wobble the duck. Backward needs more than forward: −0.30 moves nothing at all. Without a tty it warns and publishes zeros.
-- `crates/dora-mujoco-bridge` — owns the clock (`dora/timer/millis/10`), advances the simulation, publishes `joint_state`. Currently a deterministic synthetic gait; the MuJoCo binding is still a TODO.
-- `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It also consumes `joint_state`, validates the length against `duck_ipc_proto::JOINT_NAMES` (15 joints), and publishes `joint_command`; that mirror is the stub for the real state stream.
+- `crates/dora-robotd-state` — subscribes to `robot.subscribe` on `ROBOTD_SOCKET` and publishes the measured state on a 20 ms tick: `joint_state` (15 `f32`), `odom` (`[x, y, z, yaw]`) and `imu` (`[qw, qx, qy, qz, gx, gy, gz]`). A reader thread reconnects and resubscribes when robotd restarts; with `ROBOTD_SOCKET` unset it logs and publishes nothing.
+- `crates/dora-mujoco-bridge` — a deterministic synthetic gait over the 15 joints, retained as a graph-only stub. It is **not** in `dataflows/sim.yml`: the upstream twin already runs the real `robotd` against MuJoCo, and a second simulator in the graph would disagree with it.
+- `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It is a pure intent sink; state lives in `dora-robotd-state`.
 
 ### Dataflow
 
-`dataflows/sim.yml` forms a feedback loop, with the keyboard feeding the wrapper:
+`dataflows/sim.yml` has three nodes; the state and control paths are separate:
 
 ```
 keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd (ROBOTD_SOCKET)
 
-dora/timer/millis/10 ──▶ mujoco-bridge ──joint_state──▶ robotd-wrapper
-                              ▲                              │
-                              └──────── joint_command ───────┘
+robotd ──robot.state──▶ robotd-state ──joint_state / odom / imu──▶ (behaviour nodes)
 ```
 
 - `path:` in the YAML is resolved **relative to the dataflow file's directory**, hence `../target/debug/<bin>`.
-- dora supports this cycle (verified); it is message-passing, not a topological DAG restriction.
 - Payloads are **Arrow arrays of `f32`** via `IntoArrow` / `TryFrom<&ArrowData>`, not JSON. Joint count and order must come from `duck_ipc_proto::JOINT_NAMES`.
+- Both `robotd-state` and `robotd-wrapper` read `ROBOTD_SOCKET`; unset means no state and logged commands, not a failed dataflow.
 - The keyboard node needs a controlling terminal; `dora run` from a non-tty (CI, an agent shell) only exercises the zero-command path.
 
 ### Simulation launcher (A1)

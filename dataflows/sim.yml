@@ -4,20 +4,26 @@
 #   dora run dataflows/sim.yml
 #
 # Paths are resolved relative to this file, hence the `../target/...` prefix.
-# The two nodes form a feedback loop: the bridge publishes measured joint state,
-# the wrapper answers with the command robotd would apply.
 #
-# `keyboard` reads the terminal (not stdin — dora gives nodes a null stdin) and
-# publishes cmd_vel at 20 Hz. Export ROBOTD_SOCKET to forward those commands to
-# a running robotd; without it they are only logged.
+# The upstream twin (`scripts/duck-sim`) runs the real `robotd` against a
+# MuJoCo body, so this graph does not simulate anything itself:
+#
+#   robotd ──robot.state──▶ robotd-state ──joint_state / odom / imu──▶ (behaviour nodes)
+#
+#   keyboard ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd
+#
+# `robotd-state` subscribes on ROBOTD_SOCKET; without it the node logs that no
+# state will be published and the graph still runs. The wrapper forwards
+# commands to the same socket, or logs them when it is unset.
 nodes:
-  - id: mujoco-bridge
-    path: ../target/debug/dora-mujoco-bridge
+  - id: robotd-state
+    path: ../target/debug/dora-robotd-state
     inputs:
-      tick: dora/timer/millis/10
-      joint_command: robotd-wrapper/joint_command
+      tick: dora/timer/millis/20
     outputs:
       - joint_state
+      - odom
+      - imu
 
   - id: keyboard
     path: ../target/debug/dora-keyboard
@@ -29,7 +35,4 @@ nodes:
   - id: robotd-wrapper
     path: ../target/debug/dora-robotd-wrapper
     inputs:
-      joint_state: mujoco-bridge/joint_state
       cmd_vel: keyboard/cmd_vel
-    outputs:
-      - joint_command

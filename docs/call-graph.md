@@ -92,7 +92,7 @@ flowchart TB
   systemd -.->|"start / stop / restart"| daemons
 
   classDef planned stroke-dasharray: 5 5,stroke:#999,fill:#f6f6f6;
-  class state,camera,percep,brain planned;
+  class camera,percep,brain planned;
 ```
 
 读法：
@@ -158,7 +158,7 @@ flowchart TD
 
   R8 --> H["15 个舵机 + IMU"]
   R3 -.->|"robot.state 订阅推送（50 Hz）"| S1
-  subgraph S["dora-robotd-state（计划）"]
+  subgraph S["dora-robotd-state"]
     S1["收到 robot.state"] --> S2["发布 joint_state / odom / imu"]
   end
   S2 -.-> B["dora brain（计划）"]
@@ -166,10 +166,9 @@ flowchart TD
 
 图里没有画出来、但在同一层发生的两件事：
 
-- `dora-mujoco-bridge` 目前还在发合成 `joint_state`，经 wrapper 回传 `joint_command` 形成一个
-  **占位反馈环**；它不是 `robotd` 的真实状态，见 `docs/architecture.md` §4。
-- 键盘节点和 wrapper 之间的 `cmd_vel` 是 Arrow `f32[3]`，每 50 ms 一条；dora 的 daemon/zenoh
-  负责路由，不改变命令语义。
+- `dora-mujoco-bridge` 仍是确定性合成步态的独立 stub，已不在 `sim.yml` 中；`sim.yml` 的
+  `joint_state` 来自 `robotd-state` 的真实 `robot.state` 订阅。键盘节点和 wrapper 之间的
+  `cmd_vel` 是 Arrow `f32[3]`，每 50 ms 一条；dora 的 daemon/zenoh 负责路由，不改变命令语义。
 
 ## 3. 一次控制的时序
 
@@ -181,7 +180,7 @@ sequenceDiagram
   participant K as keyboard（dora，当前）
   participant W as robotd-wrapper（dora，当前）
   participant R as robotd
-  participant S as robotd-state（计划）
+  participant S as robotd-state
   participant C as camera（计划）
   participant M as mediad
   participant P as perception（计划）
@@ -231,9 +230,9 @@ sequenceDiagram
 | dora `keyboard` | `robotd-wrapper` | `cmd_vel` Arrow `f32[3]` | dora 消息 |
 | dora `robotd-wrapper` | `robotd` | `robot.move` | notification |
 | `robotd` | dora `robotd-state` | `robot.state` | 订阅推送 |
-| dora `camera` | `mediad` | `media.frame` | 请求 + 二进制 |
-| dora `camera` | `perception` | `image`（原始字节） | dora 消息（SHM） |
-| `perception` | `brain` | `target_visible` / `target_bearing` | dora 消息 |
+| dora `camera`（计划） | `mediad` | `media.frame` | 请求 + 二进制 |
+| dora `camera`（计划） | `perception`（计划） | `image`（原始字节） | dora 消息（SHM） |
+| `perception`（计划） | `brain`（计划） | `target_visible` / `target_bearing` | dora 消息 |
 | `brain` | `robotd-wrapper` | `cmd_vel` | dora 消息（计划） |
 | `updaterd` | `robotd` | `robot.health` | 请求/响应 |
 | `updaterd` | `systemd` | `systemctl restart` | 进程控制 |
