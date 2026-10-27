@@ -21,9 +21,11 @@
 # launcher then exports the matching frame socket. A real robot uses
 # `/run/mediad/media.sock`.
 #
-# `frame-sink` is a debug consumer, standing in for `perception`: it reads the
-# frame in place and logs it, and it also gives `camera` a subscriber so the
-# shared-memory path is actually exercised.
+# `frame-sink` is a debug consumer: it reads the frame in place and logs it, and
+# it gives `camera` a subscriber so the shared-memory path is exercised without
+# starting the autonomous graph. `dataflows/reactive.yml` is the separate
+# camera -> perception -> brain loop; do not run both graphs against the same
+# robot, because both would write `cmd_vel` to the wrapper.
 nodes:
   - id: robotd-state
     path: ../target/debug/dora-robotd-state

@@ -13,12 +13,17 @@
 ├── crates/
 │   ├── dora-robotd-state/      # robot.subscribe → joint_state / odom / imu
 │   ├── dora-camera/            # media.frame → image（SHM）
+│   ├── dora-perception/        # image → target（可见 / 方位 / 面积）
+│   ├── dora-brain/             # target + imu → cmd_vel
 │   ├── dora-frame-sink/        # 调试消费者：原地读 image，不拷贝
 │   ├── dora-robotd-wrapper/    # cmd_vel → robot.move
 │   ├── dora-keyboard/          # 终端键盘 → cmd_vel
-│   └── dora-mujoco-bridge/     # 合成关节状态 stub（不在 sim.yml 中使用）
+│   └── dora-mujoco-bridge/     # 合成关节状态 stub（不在数据流中使用）
 ├── dataflows/
-│   └── sim.yml                 # 仿真数据流定义
+│   ├── sim.yml                 # 遥操作：键盘 + 相机调试消费者
+│   └── reactive.yml            # 反应式行为：camera → perception → brain
+├── scenes/
+│   └── scene_target.xml        # 演示用世界：鸭子前方 0.8 m 一个固定橙色目标
 ├── docs/
 │   ├── architecture.md         # 键盘实现、上游架构与 dora 插入点
 │   └── call-graph.md           # 调用关系与调用流程
@@ -90,6 +95,7 @@ scripts/dora-sim                  # 启动 twin → 跑 dora 数据流 → 退�
 scripts/dora-sim run --stop-after 5
 DUCK_SIM_CAMERAS=a scripts/dora-sim   # 同时启动模拟相机（需要 GStreamer）
 scripts/dora-sim camera           # 打开相机窗口（必要时先启动 twin）
+scripts/dora-sim reactive         # 反应式行为：相机看目标 → 转向/前进 → 靠近停下
 scripts/dora-sim up               # 只启动 twin，保持运行
 scripts/dora-sim status           # health / 50 Hz / standing
 scripts/dora-sim drive 0.3        # 向前走 8 秒
@@ -125,6 +131,103 @@ scripts/dora-sim camera
 
 这条流程不需要浏览器或 WebRTC：窗口直接读 `media.frame` 的原始帧。
 
+## 反应式行为（perception + brain）
+
+```bash
+scripts/dora-sim reactive              # 启动 twin + 自主数据流，Ctrl-C 结束
+scripts/dora-sim reactive --stop-after 12
+```
+
+这条命令用 `dataflows/reactive.yml`，跑的是最小闭环；它需要模拟相机，所以需要 GStreamer
+（见“前置条件”）：
+
+```
+camera ──image（SHM）──▶ perception ──target──▶ brain ──cmd_vel──▶ robotd-wrapper ──robot.move──▶ robotd
+                                                    ▲
+                          robotd-state ──imu────────┘
+```
+
+`target` 是 Arrow `f32[3]`：`[visible, bearing, area]`。`bearing` 在 `[-1, 1]`，正数表示目标在
+右边；`area` 是目标像素占整帧的比例。`perception` 不做模型推理，只对 UYVY 的色度做橙色阈值，
+取匹配像素的质心；这已经够让 `brain` 转向、前进和停下。后续换 NPU 检测器时，保持这个
+消息契约即可。
+
+相机是 90° 侧装的，但 `perception` 不旋转整帧：它用 `rotate` 元数据把原始坐标映射到转正后的
+横坐标，再算方位。仿真的原始帧是 640×360，转正后是 360×640 竖屏。
+
+### 演示世界
+
+`scripts/dora-sim reactive` 默认把 `scenes/scene_target.xml` 复制到仿真器的 robot 目录，然后以
+`DUCK_SIM_SCENE=target DUCK_SIM_KEYFRAME=HOME DUCK_SIM_CAMERAS=a` 启动 twin。场景就是标准
+ground-contact 鸭子，正前方 0.8 m 放一个固定的橙色球；球没有碰撞体、没有 freejoint，不会被
+站起来的动作踢走，相机能稳定看到它。场景文件必须复制到 `robot_groundcontact.xml` 旁边，因为
+被 include 的模型用相对的 `meshdir="assets"`。
+
+如果 twin 已经在运行，`reactive` 会复用它；但那个 twin 如果不是用 `target` 场景启动的，就没有
+橙色目标，`brain` 会搜索一段时间后停下。先 `scripts/dora-sim down` 再重跑即可。
+
+### 行为
+
+`brain` 每 50 ms 发一次 `cmd_vel`，使用**开关式**控制而不是比例控制，因为策略对速度和转向都有
+死区：前进低于约 0.25 m/s、转向低于约 1.2 rad/s 时几乎不动，给小值只会让鸭子原地晃。
+
+| 条件 | 动作 |
+|---|---|
+| `abs(bearing) > 0.45` | 原地转向目标（`vyaw = ±1.50`） |
+| `abs(bearing) < 0.30` | 前进（`vx = 0.30`） |
+| 两者之间 | 保持上一步，避免抖动 |
+| `area ≥ 0.06` | 停下，锁定 `arrived` |
+| `area < 0.02` | 解除锁定，重新靠近 |
+| 目标消失超过 300 ms | 向右转搜索，最多 8 s，然后停 |
+| IMU 倾角 > 45° 或 IMU 超过 500 ms 没更新 | 立即发零 |
+| 没有 IMU（`ROBOTD_SOCKET` 未设置） | 默认拒绝驱动，打 `mode=no-imu` |
+
+这些值都可以用 `BRAIN_*` 环境变量改，例如：
+
+```bash
+BRAIN_FORWARD=0.35 BRAIN_CLOSE_AREA=0.08 scripts/dora-sim reactive
+```
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `BRAIN_FORWARD` / `BRAIN_TURN` | 0.30 / 1.50 | 前进 m/s、转向 rad/s |
+| `BRAIN_ALIGN_START` / `BRAIN_ALIGN_STOP` | 0.45 / 0.30 | 转向的进入/退出方位门限 |
+| `BRAIN_CLOSE_AREA` / `BRAIN_CLOSE_RELEASE` | 0.06 / 0.02 | 停下的进入/退出面积门限 |
+| `BRAIN_TARGET_TIMEOUT_MS` | 300 | 多久没收到可见目标算丢失 |
+| `BRAIN_SEARCH_MS` | 8000 | 搜索多久后停；`0` = 丢失立即停 |
+| `BRAIN_TILT_LIMIT_DEG` | 45 | 倾角保护 |
+| `BRAIN_REQUIRE_IMU` | 1 | 没有 IMU 时是否拒绝驱动（只做图测试可设 0） |
+
+`perception` 的阈值也可以调：`PERCEPTION_V_MIN`、`PERCEPTION_U_MAX`、`PERCEPTION_Y_MIN`
+和 `PERCEPTION_MIN_AREA`（占整帧比例，默认 0.001）。
+
+### 日志与验收
+
+一次成功的运行会看到：
+
+```
+dora-camera: ... frame N: 640x360 UYVY rotate=90 ...
+dora-perception: frame M: visible=true bearing=+0.23 area=0.013
+dora-brain: mode=turn cmd=[0.00, 0.00, -1.50] ...
+dora-brain: mode=forward cmd=[0.30, 0.00, 0.00] ...
+dora-brain: mode=arrived cmd=[0.00, 0.00, 0.00] ...
+dora-robotd-state: published 400 robot states; odom=[0.32, 0.02, ...]
+```
+
+在本机的 `target` 场景里实测：鸭子先向右找到目标，转向后前进约 0.3 m，在离目标约 0.4–0.5 m
+处停下并保持；`area` 在靠近时从约 0.013 长到约 0.06。目标丢失时会转圈搜索，8 s 后停。
+
+### 边界
+
+- **`sim.yml` 和 `reactive.yml` 不要同时跑。** 两张图都有自己的 `cmd_vel` 写者（键盘 / brain），
+  同时运行会变成 last-writer-wins。现在还没有 arbiter；要手动接管，先停掉 `reactive`。
+- `reactive.yml` 里没有键盘节点；想用键盘用 `scripts/dora-sim run`。
+- 这是**行为层 v0**，不是上游 16 状态大脑：没有 mood、记忆、探索、NPU 检测，也没有多目标
+  选择。它只证明 `感知 → 决策 → intent` 的图能闭环。
+- 停下的距离由 `area` 决定，受相机视野和头部遮挡影响；想更近/更远就调
+  `BRAIN_CLOSE_AREA`。目标太近时会掉出画面，所以不是“贴上去”。
+- `robotd` 的安全层、deadman 和跌倒失力仍然有效；`brain` 只是另一个 intent 发送方。
+
 ## 手动分步运行
 
 ```bash
@@ -144,7 +247,17 @@ robotd ──robot.state（订阅）──▶ robotd-state ──joint_state / o
 mediad ──media.frame──▶ camera ──image（SHM）──▶ frame-sink（调试消费者）
 ```
 
-`robotd-state` 通过 `ROBOTD_SOCKET` 发 `robot.subscribe`，把真实的关节角、里程计和 IMU 发布进图；未设置 socket 时它打印 `no state will be published`，数据流仍然运行。`camera` 通过 `MEDIA_FRAME_SOCKET` 拉取 `media.frame` 的原始 UYVY 帧，直接写进 dora 的 SHM sample；`frame-sink` 是临时调试消费者，原地读 `Uint8Array`，下一步会被 `perception` 替换。`keyboard` 的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 socket 时只打印日志。上游 twin 已经在跑真 `robotd` + MuJoCo，图里没有第二个仿真器。
+`robotd-state` 通过 `ROBOTD_SOCKET` 发 `robot.subscribe`，把真实的关节角、里程计和 IMU 发布进图；未设置 socket 时它打印 `no state will be published`，数据流仍然运行。`camera` 通过 `MEDIA_FRAME_SOCKET` 拉取 `media.frame` 的原始 UYVY 帧，直接写进 dora 的 SHM sample；`frame-sink` 是调试消费者，原地读 `Uint8Array`。`keyboard` 的 `cmd_vel` 由 wrapper 转成 `robot.move`；未设置 socket 时只打印日志。上游 twin 已经在跑真 `robotd` + MuJoCo，图里没有第二个仿真器。
+
+自主图是另一张 YAML：
+
+```bash
+dora run dataflows/reactive.yml
+# 或者用 scripts/dora-sim reactive 连 twin 一起启动
+```
+
+拓扑是 `camera → perception → brain → robotd-wrapper`，再加上 `robotd-state → brain` 的 IMU；
+没有键盘。两张图不要同时跑，原因见上面的“边界”。
 
 ## 键盘遥操作
 
@@ -202,25 +315,30 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`cargo test --workspace` 覆盖键盘解析、状态节点的解析/转换、相机节点的协议头解析和帧导出逻辑。端到端 smoke test：
+`cargo test --workspace` 覆盖键盘解析、状态节点的解析/转换、相机节点的协议头解析、帧导出逻辑，
+以及 perception 的 UYVY 检测/旋转映射和 brain 的转向/前进/到达/搜索/倾角逻辑。端到端 smoke test：
 
 ```bash
 scripts/dora-sim run --stop-after 5
 # 带相机：DUCK_SIM_CAMERAS=a scripts/dora-sim run --stop-after 5
+# 自主闭环：scripts/dora-sim reactive --stop-after 12
 ```
 
 ## 当前状态
 
-数据流的五个节点都能构建、能跑通。控制链、状态链和相机数据面现在都是真的：
+控制链、状态链、相机数据面和最小行为闭环现在都能跑：
 
 - `dora-keyboard`：终端键盘已经可用（`/dev/tty` + termios raw mode）。
 - `dora-robotd-wrapper`：纯 intent sink，`cmd_vel` 转成 `robot.move` 发到 `ROBOTD_SOCKET`；不再镜像 `joint_state`。
 - `dora-robotd-state`：通过 `robot.subscribe` 订阅 `robot.state`，发布 `joint_state`（15 个关节）、`odom` 和 `imu`；robotd 重启后会自动重连。
 - `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，直接写进 SHM sample；`shared_memory_pool_size: 64MB`。已在真实 sim 相机上验证（640×360、30 fps、`zenoh direct path` + SHM）；`scripts/dora-sim camera` 直接看画面，`FRAME_DUMP_DIR` 导出帧。
-- `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；支持 `FRAME_DUMP_DIR` 导出，下一步由 `perception` 替换。
-- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo 才是仿真来源。
+- `dora-perception`：橙色目标阈值 + 质心，发布 `target = [visible, bearing, area]`；按 `rotate` 把原始坐标映射到转正后的水平轴，不旋转整帧。
+- `dora-brain`：反应式行为 v0；转向/前进/到达/搜索，带方位滞回、目标超时、IMU 倾角和 `arrived` 锁定。已在 `target` 场景上跑通：找到目标 → 前进约 0.3 m → 停下保持。
+- `dora-frame-sink`：调试消费者，原地读 `Uint8Array` 并打印帧信息；支持 `FRAME_DUMP_DIR` 导出。它和 `perception` 分别属于 `sim.yml` 和 `reactive.yml`。
+- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从数据流移除；上游 twin 的 MuJoCo 才是仿真来源。
 
-下一步是 `perception` + `brain`：把 `image` 变成 `target_visible` / `target_bearing`，再输出 `cmd_vel`，见 `docs/architecture.md` §4。
+下一步是 intent arbiter（让键盘和 brain 能安全共存）、NPU 鸭子检测器，以及真正的 16 状态大脑；
+见 `docs/architecture.md` §4。
 
 ## 调试：导出 dora 收到的相机帧
 
@@ -260,8 +378,24 @@ open /tmp/frame.png
 **为什么浏览器打不开 `:8080`？**
 那是上游 `mediad` 自带的 WebRTC 控制台，不是本项目的相机窗口流程，也不是必须的。它需要 twin 常驻且 WebRTC 正常；本项目用 `scripts/dora-sim camera` 直接读 `media.frame`，不经过浏览器。
 
+**`scripts/dora-sim reactive` 里鸭子不动？**
+先看日志：`mode=no-imu` 表示没收到 `robotd-state` 的 IMU（`ROBOTD_SOCKET` 没设或 twin 没起），
+`visible=false` 且一直 `mode=search` 表示画面里没有橙色目标。用 `scripts/dora-sim down` 后重跑，
+让脚本用 `scene_target.xml` 起 twin；或者只做图测试时设 `BRAIN_REQUIRE_IMU=0`。
+
+**reactive 为什么停在离目标还有半米？**
+停下由 `area` 决定，不是距离传感器；目标太近会掉出相机视野或被脖子/头部遮挡
+`area ≥ 0.06` 时就停。想靠近一点就调大 `BRAIN_CLOSE_AREA`（例如 0.08），但可能出现一停就走、
+或者在视野边缘丢失目标；调小则停得更远。
+
+**能同时用键盘和 brain 吗？**
+现在不能安全地同时跑：`sim.yml` 的键盘和 `reactive.yml` 的 brain 都写 `cmd_vel`，同时运行是
+last-writer-wins。先停掉一张图；下一步会加 intent arbiter。
+
 **`DUCK_SIM_SCENE=apartment` 起不来？**
 当前 macOS + microduck_rl 的 `apartment` 场景会让 MuJoCo `body_server` segfault；用默认场景即可。
+`DUCK_SIM_SCENE=ball` 里的球会被站起来的动作踢走，不适合做稳定的 perception 目标；演示用
+`scene_target.xml` 的固定橙色球。
 
 ## 关于 Cargo.lock
 

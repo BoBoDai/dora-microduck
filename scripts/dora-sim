@@ -6,6 +6,7 @@
 #   scripts/dora-sim run --stop-after 5
 #   DUCK_SIM_CAMERAS=a scripts/dora-sim   # also start the simulated camera
 #   scripts/dora-sim camera          # open a window with the camera view
+#   scripts/dora-sim reactive        # camera -> perception -> brain -> robotd
 #   scripts/dora-sim up              # start the twin and leave it
 #   scripts/dora-sim status          # health + loop rate
 #   scripts/dora-sim drive 0.3       # walk forward for 8 s
@@ -98,6 +99,14 @@ prepare_rl() {
     ln -sfn "$rl_src/.venv" "$RL/.venv"
 }
 
+# `scene_target.xml` includes `robot_groundcontact.xml` and inherits its
+# `meshdir="assets"`, so it has to sit next to the robot model. Keep the repo
+# copy readable and copy it into the extracted simulator at launch time.
+install_target_scene() {
+    prepare_rl
+    cp "$ROOT/scenes/scene_target.xml" "$RL/src/mjlab_microduck/robot/microduck/scene_target.xml"
+}
+
 is_up() {
     [ -S "$SOCK" ] || return 1
     run_sim status 2>/dev/null | grep -q 'healthy'
@@ -161,6 +170,41 @@ cmd_run() {
     ROBOTD_SOCKET="$SOCK" dora run "$ROOT/dataflows/sim.yml" "$@"
 }
 
+# Autonomous slice: the fixed orange target from scenes/scene_target.xml is
+# 0.8 m ahead, `perception` turns it into a bearing, and `brain` drives the
+# duck towards it and stops when it fills enough of the frame. No keyboard in
+# this graph; the brain is the only cmd_vel writer.
+cmd_reactive() {
+    command -v cargo >/dev/null || die "cargo not found"
+    command -v dora >/dev/null || die "dora CLI not found; cargo install dora-cli --version 1.1.0"
+
+    say "building the reactive nodes"
+    ( cd "$ROOT" && cargo build --quiet -p dora-robotd-wrapper -p dora-robotd-state -p dora-camera -p dora-perception -p dora-brain )
+
+    install_target_scene
+    DUCK_SIM_SCENE="${DUCK_SIM_SCENE:-target}"
+    DUCK_SIM_KEYFRAME="${DUCK_SIM_KEYFRAME:-HOME}"
+    DUCK_SIM_CAMERAS="${DUCK_SIM_CAMERAS:-${DUCK#duck-}}"
+    export DUCK_SIM_SCENE DUCK_SIM_KEYFRAME DUCK_SIM_CAMERAS
+
+    if is_up; then
+        say "using the running twin at $SOCK"
+        if [ ! -S "$STATE/$DUCK-frame.sock" ]; then
+            die "no frame socket at $STATE/$DUCK-frame.sock; run scripts/dora-sim down, then retry"
+        fi
+        say "warning: a twin started with another scene has no orange target; restart it if needed"
+    else
+        start_sim
+        STARTED=1
+    fi
+
+    MEDIA_FRAME_SOCKET="$STATE/$DUCK-frame.sock"
+    export MEDIA_FRAME_SOCKET
+    say "reactive: orange target 0.8 m ahead; brain turns/walks towards it; Ctrl-C ends"
+    say "this script then takes the twin down"
+    ROBOTD_SOCKET="$SOCK" dora run "$ROOT/dataflows/reactive.yml" "$@"
+}
+
 case "${1:-run}" in
     run)
         if [ "$#" -gt 0 ]; then
@@ -195,6 +239,10 @@ case "${1:-run}" in
             die "no frame socket at $STATE/$DUCK-frame.sock; restart the twin with DUCK_SIM_CAMERAS=${DUCK#duck-}"
         "$ROOT/scripts/duck-camera-view" --socket "$STATE/$DUCK-frame.sock" "$@"
         ;;
+    reactive)
+        shift
+        cmd_reactive "$@"
+        ;;
     status)
         shift
         run_sim status "$@"
@@ -225,6 +273,6 @@ case "${1:-run}" in
         run_sim "$@"
         ;;
     *)
-        die "unknown command '$1' (try: run, up, status, drive, ctl, camera, log, realtime, down)"
+        die "unknown command '$1' (try: run, reactive, up, status, drive, ctl, camera, log, realtime, down)"
         ;;
 esac

@@ -887,6 +887,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-brain"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "eyre",
+]
+
+[[package]]
 name = "dora-camera"
 version = "0.1.0"
 dependencies = [
@@ -1029,6 +1037,14 @@ dependencies = [
  "uuid",
  "zenoh",
  "zenoh-ext",
+]
+
+[[package]]
+name = "dora-perception"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "eyre",
 ]
 
 [[package]]

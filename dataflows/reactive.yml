@@ -1,0 +1,62 @@
+# Reactive behaviour loop: camera -> perception -> brain -> robotd.
+#
+#   cargo build
+#   scripts/dora-sim reactive
+#
+# This is a separate graph from `sim.yml` on purpose: `sim.yml` is teleop
+# (keyboard) and `reactive.yml` is autonomy. Both end at the same
+# `robotd-wrapper`, and the wrapper still sends only `robot.move`; `robotd`
+# remains the motor authority.
+#
+# The default demo world is `scenes/scene_target.xml`: the usual ground-contact
+# duck plus one fixed orange target 0.8 m ahead. `scripts/dora-sim reactive`
+# copies it next to the simulator's robot model (the include and its `assets`
+# mesh directory are relative to that directory) and starts the twin with
+# `DUCK_SIM_SCENE=target DUCK_SIM_KEYFRAME=HOME DUCK_SIM_CAMERAS=a`.
+#
+#   robotd-state ──imu──▶ brain
+#   camera ──image (SHM)──▶ perception ──target──▶ brain ──cmd_vel──▶ wrapper
+#
+# `robotd-state` also publishes `joint_state` and `odom`; they have no consumer
+# in this slice. The camera needs the simulated/real `media.frame` socket
+# (`MEDIA_FRAME_SOCKET`), and the brain needs `ROBOTD_SOCKET` through the
+# wrapper. Without an IMU the brain refuses to drive (BRAIN_REQUIRE_IMU=1), so
+# a graph-only run logs `no-imu` and stays still.
+nodes:
+  - id: robotd-state
+    path: ../target/debug/dora-robotd-state
+    inputs:
+      tick: dora/timer/millis/20
+    outputs:
+      - joint_state
+      - odom
+      - imu
+
+  - id: camera
+    path: ../target/debug/dora-camera
+    inputs:
+      tick: dora/timer/millis/33
+    outputs:
+      - image
+    shared_memory_pool_size: 64MB
+
+  - id: perception
+    path: ../target/debug/dora-perception
+    inputs:
+      image: camera/image
+    outputs:
+      - target
+
+  - id: brain
+    path: ../target/debug/dora-brain
+    inputs:
+      tick: dora/timer/millis/50
+      target: perception/target
+      imu: robotd-state/imu
+    outputs:
+      - cmd_vel
+
+  - id: robotd-wrapper
+    path: ../target/debug/dora-robotd-wrapper
+    inputs:
+      cmd_vel: brain/cmd_vel

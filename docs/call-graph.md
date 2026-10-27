@@ -11,9 +11,10 @@
 图例：
 
 - 实线箭头：请求/响应（JSON-RPC call，可能有回复）。
-- 虚线箭头：通知/订阅推送（server → client，不需要回复）。
+- 虚线箭头：通知/订阅推送（server → client，不需要回复）；带“计划”标签的是尚未实现的
+  arbiter 路径。
 - 粗箭头：大块数据（相机帧、WebRTC、共享内存）。
-- 虚线框节点：计划中的 dora 节点，当前仓库还没有。
+- 虚线框节点：计划中的 dora 节点（目前只有 intent arbiter）。
 
 ```mermaid
 flowchart TB
@@ -54,6 +55,7 @@ flowchart TB
     sink["frame-sink（调试）"]
     percep["perception"]
     brain["brain"]
+    arb["intent arbiter（计划）"]
   end
 
   phone -->|"BLE"| btd
@@ -70,16 +72,19 @@ flowchart TB
   btd -->|"update.*"| updaterd
   padd -->|"robot.move / robot.do"| robotd
 
-  kb -->|"cmd_vel"| wrapper
+  kb -->|"cmd_vel（sim.yml）"| wrapper
+  kb -.->|"cmd_vel（计划）"| arb
   wrapper -->|"robot.move（notification）"| robotd
   robotd -.->|"robot.state（50 Hz 订阅推送）"| state
   state -.->|"joint_state / odom / imu"| brain
   camera -->|"media.frame 请求"| mediad
   mediad ==>|"header + UYVY 字节"| camera
-  camera ==>|"image（SHM）"| sink
-  camera -.->|"image（计划）"| percep
+  camera ==>|"image（SHM，sim.yml）"| sink
+  camera ==>|"image（SHM，reactive.yml）"| percep
   percep -->|"target"| brain
-  brain -->|"cmd_vel（计划）"| wrapper
+  brain -->|"cmd_vel（reactive.yml）"| wrapper
+  brain -.->|"cmd_vel（计划）"| arb
+  arb -.->|"cmd_vel（计划）"| wrapper
 
   mediad ==>|"WebRTC H.264 + control"| space
   mediad --> camhw
@@ -94,7 +99,7 @@ flowchart TB
   systemd -.->|"start / stop / restart"| daemons
 
   classDef planned stroke-dasharray: 5 5,stroke:#999,fill:#f6f6f6;
-  class percep,brain planned;
+  class arb planned;
 ```
 
 读法：
@@ -106,8 +111,11 @@ flowchart TB
   `media.frame`（给本机 perception）。
 - `tofd` 单独拥有 ToF，不经过 `robotd`。
 - `configd` / `updaterd` / `btd` 是恢复路径：它们不依赖 `robotd`，`robotd` 死了也要能工作。
-- dora 的 `keyboard → wrapper` 是当前唯一的真实控制链；`state`、`camera`、`perception`、
-  `brain` 是目标切片，虚线框标出。
+- dora 有两条**互斥**的当前控制链：`sim.yml` 的 `keyboard → wrapper`，和 `reactive.yml`
+  的 `camera → perception → brain → wrapper`。两张图不要同时跑；虚线框的 intent arbiter
+  是合并它们之前要补的仲裁层。
+- `state`、`camera`、`perception`、`brain` 都是当前实现；`perception` 和 `brain` 只在
+  `reactive.yml` 里连接。
 
 ## 2. 调用流程（当前真实路径）
 
@@ -163,7 +171,7 @@ flowchart TD
   subgraph S["dora-robotd-state"]
     S1["收到 robot.state"] --> S2["发布 joint_state / odom / imu"]
   end
-  S2 -.-> B["dora brain（计划）"]
+  S2 -.->|"仅 reactive.yml"| B["dora brain"]
 ```
 
 图里没有画出来、但在同一层发生的三件事：
@@ -171,39 +179,44 @@ flowchart TD
 - `dora-mujoco-bridge` 仍是确定性合成步态的独立 stub，已不在 `sim.yml` 中；`sim.yml` 的
   `joint_state` 来自 `robotd-state` 的真实 `robot.state` 订阅。键盘节点和 wrapper 之间的
   `cmd_vel` 是 Arrow `f32[3]`，每 50 ms 一条；dora 的 daemon/zenoh 负责路由，不改变命令语义。
-- 相机路径是独立的一条：`mediad → camera → image → frame-sink`，不经过 `robotd`，也不在
-  上面这张控制流程图里；`frame-sink` 是调试消费者，`perception` 会替换它。
+- 相机路径在 `sim.yml` 是 `mediad → camera → image → frame-sink`，在 `reactive.yml` 是
+  `mediad → camera → image → perception → brain`，都不经过 `robotd`，也不在上面这张键盘
+  流程图里。`frame-sink` 是调试消费者；`perception` 是真实消费者，两者属于不同的图。
 
-## 3. 一次控制的时序
+## 3. 两条控制链的时序
 
-这张图把“键盘驱动”和“感知驱动”放在同一条时间轴上，并标出哪些是当前实现、哪些是计划。
+键盘链在 `sim.yml`，感知链在 `reactive.yml`；两张图不能同时跑，因为都直接写 wrapper 的
+`cmd_vel`。虚线框的 arbiter 是合并它们之前要补的层。
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant K as keyboard（dora，当前）
-  participant W as robotd-wrapper（dora，当前）
+  participant K as keyboard（sim.yml）
+  participant W as robotd-wrapper（两张图共用）
   participant R as robotd
   participant S as robotd-state
-  participant C as camera（当前）
+  participant C as camera（两张图共用）
   participant M as mediad
-  participant F as frame-sink（调试）
-  participant P as perception（计划）
-  participant B as brain（计划）
+  participant F as frame-sink（sim.yml 调试）
+  participant P as perception（reactive.yml）
+  participant B as brain（reactive.yml）
 
+  Note over K,W: sim.yml：遥操作
   K->>W: cmd_vel [vx, vy, vyaw]（每 50 ms）
   W->>R: robot.move（notification，无 id、无回复）
   R-->>S: robot.state（50 Hz 订阅推送）
-  S-->>B: joint_state / odom / imu
   C->>M: media.frame（请求一帧）
   M-->>C: JSON header + UYVY 字节（约 1.8 MiB）
-  C-->>F: image（SHM 零拷贝，当前）
-  C-->>P: image（计划）
-  P-->>B: target_visible / target_bearing
-  B->>W: cmd_vel（行为层 intent，计划）
+  C-->>F: image（SHM 零拷贝）
+
+  Note over C,B: reactive.yml：自主闭环
+  C-->>P: image（SHM 零拷贝）
+  P-->>B: target = [visible, bearing, area]
+  S-->>B: imu = [qw, qx, qy, qz, gx, gy, gz]
+  B->>W: cmd_vel（行为层 intent）
 
   Note over R: 安全层仍在 robotd：关节限位、<br/>跌倒失力、intent deadman；<br/>图不能绕过。
-  Note over W,B: 键盘与 brain 不能同时直接写同一个输入；<br/>需要一个 arbiter 节点，<br/>或 wrapper 增加第二个 cmd_vel 输入。
+  Note over W,B: 当前 keyboard 和 brain 不能同时写 wrapper；<br/>虚线 arbiter 是下一步：<br/>manual 优先 + 超时回退。
 ```
 
 时序里的关键点：
@@ -236,14 +249,17 @@ sequenceDiagram
 | `btd` | `configd` / `updaterd` | `net.*` / `system.*` / `update.*` | transport |
 | `padd` | `robotd` | `robot.move` 等 intents | notification |
 | `mediad` | `robotd` | 状态/配置查询 | 请求/响应 |
-| dora `keyboard` | `robotd-wrapper` | `cmd_vel` Arrow `f32[3]` | dora 消息 |
+| dora `keyboard`（sim.yml） | `robotd-wrapper` | `cmd_vel` Arrow `f32[3]` | dora 消息 |
 | dora `robotd-wrapper` | `robotd` | `robot.move` | notification |
 | `robotd` | dora `robotd-state` | `robot.state` | 订阅推送 |
 | dora `camera` | `mediad` | `media.frame` | 请求 + 二进制 |
-| dora `camera` | dora `frame-sink`（调试） | `image`（原始字节） | dora 消息（SHM） |
-| dora `camera` | `perception`（计划） | `image`（原始字节） | dora 消息（SHM，计划） |
-| `perception`（计划） | `brain`（计划） | `target_visible` / `target_bearing` | dora 消息 |
-| `brain` | `robotd-wrapper` | `cmd_vel` | dora 消息（计划） |
+| dora `camera`（sim.yml） | dora `frame-sink`（调试） | `image`（原始字节） | dora 消息（SHM） |
+| dora `camera`（reactive.yml） | dora `perception` | `image`（原始字节） | dora 消息（SHM） |
+| dora `perception` | dora `brain` | `target = [visible, bearing, area]` | dora 消息 |
+| dora `robotd-state` | dora `brain` | `imu = [qw, qx, qy, qz, gx, gy, gz]` | dora 消息 |
+| dora `brain`（reactive.yml） | `robotd-wrapper` | `cmd_vel` | dora 消息 |
+| dora `keyboard` / `brain`（计划） | `intent arbiter` | `cmd_vel`（manual / auto） | dora 消息（计划） |
+| `intent arbiter`（计划） | `robotd-wrapper` | `cmd_vel` | dora 消息（计划） |
 | `updaterd` | `robotd` | `robot.health` | 请求/响应 |
 | `updaterd` | `systemd` | `systemctl restart` | 进程控制 |
 | `systemd` | 所有 daemon | start / stop / restart / watchdog | 监督 |
@@ -265,3 +281,7 @@ sequenceDiagram
 - **恢复路径不能被 dora 依赖。** `configd`、`updaterd`、`btd` 在 `robotd` 死掉时仍要工作；
   dora 挂在它们上面会把恢复路径变成“先有 dora 才能修机器人”。
 - **跨机不共享内存。** `media.frame` 和 dora 的 SHM 都是同机路径；跨机走 WebRTC/网络。
+- **`sim.yml` 和 `reactive.yml` 互斥。** 当前键盘和 brain 都直接写 wrapper 的 `cmd_vel`，
+  同时运行是 last-writer-wins；arbiter 落地之前，手动接管要先停掉 `reactive`。
+- **`brain` 不是安全层。** 它会在倾角/IMU 超时/目标丢失时发零，但真正的关节限位、跌倒
+  失力和 deadman 仍在 `robotd`。

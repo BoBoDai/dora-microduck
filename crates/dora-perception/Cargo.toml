@@ -1,0 +1,11 @@
+[package]
+name = "dora-perception"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Dora node that finds a coloured target in a UYVY camera frame"
+publish = false
+
+[dependencies]
+dora-node-api = { workspace = true, features = ["arrow-v59"] }
+eyre.workspace = true

@@ -21,9 +21,11 @@
   socket client；感知没有通用数据面；自主大脑没有移植。
 - dora 插在 `robotd` 之上：节点图负责行为组合，Arrow + 共享内存负责大帧数据面，
   coordinator 负责生命周期。`robotd` 仍然是唯一电机权威，dora 不碰安全，也不进恢复路径。
-- 本仓库已经接通控制链、状态链和相机数据面：`keyboard → robotd-wrapper → robotd`、
-  `robotd → robotd-state → joint_state / odom / imu`，以及
-  `mediad → camera → image（SHM）→ frame-sink`。感知和行为节点还没开始。
+- 本仓库已经接通控制链、状态链、相机数据面和最小行为闭环：`keyboard → robotd-wrapper →
+  robotd`、`robotd → robotd-state → joint_state / odom / imu`，以及
+  `mediad → camera → image（SHM）→ perception → target → brain → cmd_vel → wrapper`。
+  `perception` 是最笨的颜色检测，`brain` 是反应式行为 v0；16 状态大脑、mood、NPU 检测器
+  仍然没有。
 
 ## 1. 当前键盘控制
 
@@ -296,7 +298,8 @@ dora 提供：
 ### 3.3 插入点二：感知数据面与零拷贝
 
 问题：上游原则是“帧不跨 socket”，但现成的路径要么是按需 `media.frame`，要么是 WebRTC；
-缺少一个通用的 perception → fusion → brain 的数据面。
+缺少一个通用的 perception → fusion → brain 的数据面。本仓库用 `camera → perception →
+brain` 补上了最小的一段（见 §4.5），但还不是通用融合层。
 
 dora 1.1.0 的实现：
 
@@ -416,29 +419,48 @@ dora 提供：
   发布 `image` 和 `width`/`height`/`format`/`rotate` 元数据；`shared_memory_pool_size: 64MB`。
   已在真实 sim 相机上验证（640×360、30 fps、`zenoh direct path` + SHM），也验证过假的
   `media.frame` 服务；`scripts/dora-sim camera` 直接看画面，`FRAME_DUMP_DIR` 导出帧。
-- `dora-frame-sink`：临时调试消费者，原地读 `Uint8Array` 并打印帧信息；下一步由 `perception`
-  替换。它的存在也让 camera 的输出有订阅者，从而真正走 SHM 路径。设置 `FRAME_DUMP_DIR`
-  可以把收到的原始 UYVY 帧和 `.json` 元数据写到磁盘，供 ffmpeg 离线查看；
-  `FRAME_DUMP_EVERY`（默认 30）和 `FRAME_DUMP_LIMIT`（默认 10，0 = 不限）控制频率和上限。
-- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从 `sim.yml` 移除；上游 twin 的 MuJoCo
+- `dora-perception`：消费 `image`，发布 `target = [visible, bearing, area]`（`f32[3]`）。
+  它不是模型，是 UYVY 色度阈值 + 质心：橙色/红色目标的 `V` 高、`U` 低，地板/天空接近
+  `U=V=128`。不旋转整帧，而是用 `rotate` 把原始坐标映射到转正后的水平轴（90° 时
+  `x_upright = height - 1 - y_raw`），所以 460 KB 的帧只读一遍。阈值由 `PERCEPTION_*`
+  覆盖。
+- `dora-brain`：消费 `target` 和 `robotd-state` 的 `imu`，每 50 ms 发布 `cmd_vel`。反应式
+  v0：`|bearing| > 0.45` 转向，`< 0.30` 前进，中间保持；`area ≥ 0.06` 停下并锁定，
+  `< 0.02` 才解除；目标丢失 300 ms 后向右搜索，最多 8 s；倾角 > 45° 或 IMU 超过 500 ms
+  没更新就发零；默认没有 IMU 拒绝驱动。转向用策略真正能执行的值（1.5 rad/s），不做
+  “温和”比例控制，否则鸭子只晃不走。细节见 §4.5。
+- `dora-frame-sink`：`sim.yml` 里的调试消费者，原地读 `Uint8Array` 并打印帧信息，同时让
+  camera 的输出有订阅者，从而真正走 SHM 路径。设置 `FRAME_DUMP_DIR` 可以把收到的原始
+  UYVY 帧和 `.json` 元数据写到磁盘，供 ffmpeg 离线查看；`FRAME_DUMP_EVERY`（默认 30）和
+  `FRAME_DUMP_LIMIT`（默认 10，0 = 不限）控制频率和上限。它和 `perception` 属于两张图。
+- `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从数据流移除；上游 twin 的 MuJoCo
   才是仿真来源。
-- `dataflows/sim.yml`：五个节点，状态链、相机数据面和控制链分离；假反馈环已删除。
-- `scripts/dora-sim`：负责 twin 生命周期、tty echo、`ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`、
-  `dora run`；`camera` 子命令用 `scripts/duck-camera-view`（Python/OpenCV）打开
-  `media.frame` 窗口。
+- `dataflows/sim.yml`：五个节点，遥操作：键盘控制链、状态链、相机调试消费者；假反馈环已删除。
+- `dataflows/reactive.yml`：五个节点，自主闭环：`camera → perception → brain → wrapper`，
+  加上 `robotd-state → brain` 的 IMU；没有键盘。
+- `scenes/scene_target.xml`：演示世界，标准鸭子 + 前方 0.8 m 一个固定橙色球。球没有碰撞体、
+  没有 freejoint，不会被站起来的动作踢走。脚本把它复制到仿真器的 robot 目录，因为模型
+  用相对的 `meshdir="assets"`。
+- `scripts/dora-sim`：负责 twin 生命周期、tty echo、`ROBOTD_SOCKET` /
+  `MEDIA_FRAME_SOCKET`、`dora run`；`camera` 子命令用 `scripts/duck-camera-view`
+  （Python/OpenCV）打开 `media.frame` 窗口；`reactive` 子命令复制 target 场景、启动
+  `reactive.yml`。
 
-也就是说：**控制链、状态链和相机数据面现在都是真的。** 缺的是感知和行为。
+也就是说：**控制链、状态链、相机数据面和最小行为闭环现在都是真的。** 缺的是 arbiter、
+NPU 检测器和真正的 16 状态大脑。
 
 ### 4.2 目标图
 
 ```
-robotd-state ──joint_state / odom / imu──┐
-                                         ├──▶ brain ──cmd_vel──▶ wrapper ──robot.move──▶ robotd
-camera ──image──▶ perception ──target────┘
+robotd-state ──imu──┐
+                    ├──▶ brain ──cmd_vel──▶ wrapper ──robot.move──▶ robotd
+camera ──image──▶ perception ──target──┘
 ```
 
-`robotd-state` 和 `camera` 已经是当前实现；`perception` 和 `brain` 还是计划。当前
-`camera → frame-sink` 是调试替代，用来验证帧路径和 SHM。
+这张图现在就是 `dataflows/reactive.yml` 的实际内容；`robotd-state` 还会发布 `joint_state`
+和 `odom`，但这一版没有消费者。`camera → frame-sink` 仍然在 `sim.yml` 里，作为遥操作时的
+帧路径调试分支；两张图不要同时跑，因为 `keyboard` 和 `brain` 都会写 `cmd_vel`，而目前还
+没有 arbiter。
 
 ### 4.3 分步
 
@@ -452,12 +474,16 @@ camera ──image──▶ perception ──target────┘
    `output image: … B -> zenoh direct path` 和 `entering zenoh put of an SHM buffer`。
    `media.frame` 每个连接只返回一帧，所以节点每个 tick 重连一次（只在首连/失败后打印）；
    协议本身也已用假 `media.frame` 服务单独验证。
-3. **最小 perception + brain（下一步）**：先不接 NPU/模型，做一个最笨的检测
-   （颜色/亮度/运动），输出 `target_visible`、`target_bearing`；`brain` 做反应式控制
-   （可见则转向/前进，丢失则停）。`robotd-wrapper` 仍是唯一 intent sink。
-4. **管理**：YAML 加 `restart_policy: on-failure`、`startup_timeout`、
+3. **最小 perception + brain（已完成）**：颜色阈值检测，输出 `target =
+   [visible, bearing, area]`；`brain` 做反应式控制（转向/前进/到达/搜索）。`robotd-wrapper`
+   仍是唯一 intent sink。`reactive.yml` 和 `scenes/scene_target.xml` 一起提供可复现的实验；
+   细节见 §4.5。实测在 target 场景上找到目标、前进约 0.3 m、在约 0.4–0.5 m 处停下并保持。
+4. **intent arbiter（下一步）**：键盘和 brain 都写 `cmd_vel`，现在不能安全共存。加一个
+   arbiter 节点（manual 优先/可切换，带超时回退）或给 wrapper 增加第二个输入，再决定
+   哪个是默认写者。这一层应该在 `reactive.yml` 与 `sim.yml` 合并之前完成。
+5. **管理**：YAML 加 `restart_policy: on-failure`、`startup_timeout`、
    `health_check_timeout`；切片稳定后再加 `dora up` + `scripts/dora-sim managed`。
-5. **之后**：16 状态大脑、NPU 鸭子检测器、真机部署、板载资源测量。
+6. **之后**：16 状态大脑、NPU 鸭子检测器、真机部署、板载资源测量。
 
 ### 4.4 验收
 
@@ -466,9 +492,128 @@ camera ──image──▶ perception ──target────┘
 - 相机帧（>4 KB）在日志里走 `zenoh direct path`，不是 `daemon path`；已在真实 sim 相机
   （640×360）和假 `media.frame` 服务上验证（已完成）。GStreamer 已安装；`apartment` 场景
   当前会让 `body_server` segfault，默认场景可用。
-- 目标进入视野时鸭子转向/前进，目标丢失时停下。
+- 目标进入视野时鸭子转向/前进，靠近后停下并保持（已完成：`scripts/dora-sim reactive
+  --stop-after 12`，日志出现 `visible=true` → `mode=turn` → `mode=forward` →
+  `mode=arrived`，odom x 约 0.02 → 0.32）。
+- 目标丢失 300 ms 后进入 `mode=search`，8 s 后停止；IMU 倾角超过 45°、IMU 超过 500 ms
+  未更新或没有 IMU 时发零（单元测试覆盖；真机还需要实测策略对 1.5 rad/s 的响应）。
 - brain 被杀掉时，`robotd` 的 deadman 让鸭子停下；如果加了 restart policy，brain 能回来。
 - `dora node list` 显示所有节点健康。
+
+当前未覆盖：键盘和 brain 同时运行（没有 arbiter）、NPU/模型检测、目标身份/多目标、
+mood/记忆/探索、真机部署。
+
+### 4.5 最小感知与行为（reactive v0）
+
+#### 消息契约
+
+```
+camera.image (UInt8, SHM)
+  metadata: width, height, format="UYVY", rotate, bytes, captured_at_unix_us
+
+perception.target (f32[3])
+  [visible (0/1), bearing (-1 左 .. +1 右), area (占整帧比例)]
+
+brain.cmd_vel (f32[3])
+  [vx, vy, vyaw]，和键盘节点同一个契约，进同一个 wrapper
+
+robotd-state.imu (f32[7])
+  [qw, qx, qy, qz, gx, gy, gz]
+```
+
+`target` 用一条消息发三个字段而不是三个 topic，是为了让 `visible`、`bearing`、`area`
+来自同一帧，不会被跨 topic 的调度拆开。
+
+#### perception
+
+- 输入格式必须是 `UYVY`；`width`/`height` 与 payload 长度不符时丢弃并限频打日志。
+- 每个 4 字节宏像素是 `U, Y0, V, Y1`，两个像素共享色度。命中条件是
+  `V ≥ PERCEPTION_V_MIN`（默认 150）、`U ≤ PERCEPTION_U_MAX`（120）、
+  `Y ≥ PERCEPTION_Y_MIN`（50）。橙色（RGB 255,140,0）约 `U=40, V=197, Y=158`；
+  地板/天空/白线接近 `U=V=128`，所以色差是信号。
+- 面积小于 `PERCEPTION_MIN_AREA`（默认 0.001，即 640×360 的约 230 像素）不发布可见目标。
+- **不旋转整帧。** 相机是 90° 侧装的；如果先 `transpose` 再算质心，每帧都要多一次
+  460 KB 的拷贝/重排。节点只把每个命中像素的原始坐标映射到转正后的水平轴：
+
+  ```
+  rotate 0:   x_upright = x_raw
+  rotate 90:  x_upright = height - 1 - y_raw      （顺时针转正）
+  rotate 180: x_upright = width - 1 - x_raw
+  rotate 270: x_upright = y_raw
+  ```
+
+  转正后的宽度在 90/270 时是原始 `height`。方位
+  `bearing = 2 * (mean_x_upright + 0.5) / upright_width - 1`，正数在右。
+- 这是**颜色检测**，不是鸭子检测器：同色的其他物体、强反光、不同灯光都会影响它。替换成
+  NPU 模型时保持 `target` 契约即可，brain 不用改。
+
+#### brain
+
+控制律是开关式 + 滞回，不是比例控制。原因是策略死区：前进低于约 0.25 m/s、转向低于约
+1.2 rad/s 时几乎不动；给“温和”的小值只会让鸭子原地晃。转向还可用，但方向由 `bearing`
+的符号决定：
+
+| 条件 | 输出 |
+|---|---|
+| `abs(bearing) > 0.45` | `vyaw = -sign(bearing) * 1.50`（目标在右 → 负 yaw，因为正 yaw 是左转） |
+| `abs(bearing) < 0.30` | `vx = 0.30`，`vyaw = 0` |
+| `0.30 ≤ abs(bearing) ≤ 0.45` | 保持上一步，避免在阈值附近抖动 |
+| `area ≥ 0.06` | 全零，锁定 `arrived` |
+| `arrived` 且 `area ≥ 0.02` | 继续全零 |
+| `arrived` 且 `area < 0.02` | 解除锁定，重新对齐/靠近 |
+| 没有可见目标超过 300 ms | 向右转 1.50 rad/s，最多 8 s；之后全零 |
+
+宽度 0.30–0.45 是实测调出来的：0.10–0.20 的窄带理论上更准，但转向延迟让鸭子反复过冲，
+在原地左右摇。离目标几十厘米时 5° 的偏差仍然在正前方。
+
+安全：
+
+- IMU 四元数算 roll/pitch；超过 `BRAIN_TILT_LIMIT_DEG`（45°）立即全零。
+- IMU 超过 `BRAIN_IMU_TIMEOUT_MS`（500 ms）没更新，或 `BRAIN_REQUIRE_IMU=1`（默认且没有
+  IMU）时全零，日志 `mode=no-imu`。这是刻意的：没有姿态就不自动走。
+- 目标消息超时（300 ms）不会继续沿旧方位走，而是进入搜索，然后停。
+- `robotd` 的安全层、deadman、跌倒失力照常生效；`brain` 只是另一个 intent 发送方。
+
+调参（`BRAIN_*`）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `BRAIN_FORWARD` / `BRAIN_TURN` | 0.30 / 1.50 | 前进 m/s、转向 rad/s |
+| `BRAIN_ALIGN_START` / `BRAIN_ALIGN_STOP` | 0.45 / 0.30 | 进入/退出转向的方位门限 |
+| `BRAIN_CLOSE_AREA` / `BRAIN_CLOSE_RELEASE` | 0.06 / 0.02 | 停下/解除停下的面积门限 |
+| `BRAIN_TARGET_TIMEOUT_MS` | 300 | 目标多久没更新算丢失 |
+| `BRAIN_SEARCH_MS` | 8000 | 搜索上限；0 = 丢失立即停 |
+| `BRAIN_TILT_LIMIT_DEG` | 45 | 倾角保护 |
+| `BRAIN_IMU_TIMEOUT_MS` | 500 | IMU 超时 |
+| `BRAIN_REQUIRE_IMU` | 1 | 没有 IMU 是否拒绝驱动 |
+
+#### 场景与启动
+
+`scenes/scene_target.xml` 是标准 ground-contact 鸭子 + 正前方 0.8 m 一个半径 5 cm 的橙色球。
+球 `contype=0 conaffinity=0` 且没有 freejoint：不会被站起来的动作踢走，也不会和鸭子碰撞。
+场景没有 keyframe，所以必须 `DUCK_SIM_KEYFRAME=HOME`。
+
+`scripts/dora-sim reactive`：
+
+1. `cargo build` 相关节点；
+2. `prepare_rl` 确保 `target/duck-sim/rl` 存在；
+3. 把 `scenes/scene_target.xml` 复制到
+   `target/duck-sim/rl/src/mjlab_microduck/robot/microduck/scene_target.xml`，因为 include
+   的 `robot_groundcontact.xml` 用相对的 `meshdir="assets"`；
+4. 以 `DUCK_SIM_SCENE=target`、`DUCK_SIM_KEYFRAME=HOME`、`DUCK_SIM_CAMERAS=a` 启动（或复用）
+   twin；
+5. 导出 `MEDIA_FRAME_SOCKET`、`ROBOTD_SOCKET`，运行 `dora run dataflows/reactive.yml`。
+
+#### 实测与边界
+
+- 相机 640×360 UYVY、30 Hz；perception 每帧读一遍，未观察到节点拖慢 50 Hz 控制环。
+- 第一次看到目标时 `area` 约 0.001–0.013，方位可能在 ±0.98；brain 先转向，进入
+  `forward` 后前进。靠近时 `area` 长到 0.06 左右，`mode=arrived`，odom x 从约 0.02 到
+  0.32（目标在 x=0.8），随后保持不动。
+- 目标丢失时会向右转搜索；8 s 没找到就停。停在约 0.4–0.5 m，是因为再近目标会掉出相机
+  视野/被头部遮挡，不是距离估计。
+- 目前没有 arbiter，`sim.yml` 和 `reactive.yml` 不能同时跑；也没有多目标、目标身份、
+  16 状态、mood、记忆和 NPU。`brain` 是行为层 v0，不是替代上游大脑。
 
 ## 5. 参考
 
@@ -477,11 +622,15 @@ camera ──image──▶ perception ──target────┘
 - `crates/dora-keyboard/src/main.rs`：键盘解析、raw mode、hold 计时、测试。
 - `crates/dora-robotd-state/src/main.rs`：`robot.subscribe` → `joint_state` / `odom` / `imu`。
 - `crates/dora-camera/src/main.rs`：`media.frame` → `image`，二进制尾部直接读进 sample。
+- `crates/dora-perception/src/main.rs`：UYVY 颜色检测、旋转坐标映射、`target` 输出。
+- `crates/dora-brain/src/main.rs`：反应式控制、滞回、搜索、IMU/倾角保护。
 - `crates/dora-frame-sink/src/main.rs`：调试消费者，原地读 `Uint8Array`。
 - `crates/dora-robotd-wrapper/src/main.rs`：`cmd_vel` → `robot.move`。
-- `crates/dora-mujoco-bridge/src/main.rs`：合成步态 stub（不在 `sim.yml` 中）。
-- `dataflows/sim.yml`：五个节点和各自的 tick。
-- `scripts/dora-sim`：twin 生命周期和 `ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`。
+- `crates/dora-mujoco-bridge/src/main.rs`：合成步态 stub（不在数据流中）。
+- `dataflows/sim.yml`：遥操作五个节点和各自的 tick。
+- `dataflows/reactive.yml`：自主闭环五个节点。
+- `scenes/scene_target.xml`：固定橙色目标的演示世界。
+- `scripts/dora-sim`：twin 生命周期、`ROBOTD_SOCKET` / `MEDIA_FRAME_SOCKET`、target 场景。
 - `scripts/duck-camera-view`：`media.frame` 相机窗口（Python/OpenCV，调试工具）。
 - `README.md`、`CLAUDE.md`：命令、版本耦合、约定。
 

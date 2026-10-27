@@ -1,0 +1,11 @@
+[package]
+name = "dora-brain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Dora node that turns a perceived target into a reactive velocity command"
+publish = false
+
+[dependencies]
+dora-node-api.workspace = true
+eyre.workspace = true
