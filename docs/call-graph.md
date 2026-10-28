@@ -56,6 +56,7 @@ flowchart TB
     percep["perception"]
     brain["brain"]
     autod["autod（上游 12 状态）"]
+    tof["tof"]
     arb["intent arbiter（计划）"]
   end
 
@@ -84,9 +85,10 @@ flowchart TB
   camera ==>|"image（SHM，reactive.yml）"| percep
   percep -->|"target"| brain
   brain -->|"cmd_vel（reactive.yml）"| wrapper
-  robotd -.->|"robot.state（autod.yml）"| autod
-  tofd -.->|"tof.stream（autod.yml）"| autod
-  autod -->|"robot.move/head/mouth/pose/sound/do"| robotd
+  tofd -.->|"tof.stream（autod.yml）"| tof
+  tof -.->|"tof（JSON TofFrame）"| autod
+  state -.->|"robot_state（autod.yml）"| autod
+  autod -->|"cmd_vel/head/mouth/body/sound/skill"| wrapper
   brain -.->|"cmd_vel（计划）"| arb
   autod -.->|"全部 intent（计划）"| arb
   arb -.->|"cmd_vel（计划）"| wrapper
@@ -118,11 +120,11 @@ flowchart TB
 - `configd` / `updaterd` / `btd` 是恢复路径：它们不依赖 `robotd`，`robotd` 死了也要能工作。
 - dora 有**三条互斥**的当前控制链：`sim.yml` 的 `keyboard → wrapper`、`reactive.yml` 的
   `camera → perception → brain → wrapper`，以及 `autod.yml` 的
-  `robotd/tofd → autod → robotd`。三张图不要同时跑；虚线框的 intent arbiter 是合并它们
-  之前要补的仲裁层。
-- `autod` 和另外两条链不同：它不经过 dora topic，而是直接开 `robotd`/`tofd` socket，所以
-  图里画的是 socket 关系。这是第一版移植的取舍。
-- `state`、`camera`、`perception`、`brain`、`autod` 都是当前实现；只有前四个走 dora 消息。
+  `robotd-state → autod ← tof → wrapper`。三张图不要同时跑；虚线框的 intent arbiter 是
+  合并它们之前要补的仲裁层。
+- `autod` 现在和另外两条链一样走 dora topic；只有 source/sink 节点还开 socket：
+  `robotd-state` 读 `robotd`、`tof` 读 `tofd`、`wrapper` 写 `robotd`。
+- `state`、`camera`、`perception`、`brain`、`autod`、`tof` 都是当前实现。
 
 ## 2. 调用流程（当前真实路径）
 
@@ -189,9 +191,8 @@ flowchart TD
 - 相机路径在 `sim.yml` 是 `mediad → camera → image → frame-sink`，在 `reactive.yml` 是
   `mediad → camera → image → perception → brain`，都不经过 `robotd`，也不在上面这张键盘
   流程图里。`frame-sink` 是调试消费者；`perception` 是真实消费者，两者属于不同的图。
-- `autod.yml` 是第三条独立链：`robotd ──robot.state──▶ autod ──intents──▶ robotd`，外加
-  `tofd ──tof.stream──▶ autod`。它不用相机、不经过 wrapper，直接发全部 intent；因此
-  它的状态/ToF 还不在 dora topic 里。
+- `autod.yml` 是第三条独立链：`robotd-state ──robot_state──▶ autod`、`tof ──tof──▶ autod`、
+  `autod ──intents──▶ wrapper`。source/sink 节点仍开 socket，但 `autod` 本身完全走 dora。
 
 ## 3. 两条控制链的时序
 
@@ -242,8 +243,9 @@ sequenceDiagram
   `allocate_data_sample` + `encode_uint8_ipc_header` + `send_output_sample` 把二进制尾部
   直接读进 sample，效果等同于 `send_output_raw` 的 0 拷贝路径；接收端 `values()` 直接
   alias 那块内存。`send_output`（Arrow 数组）则是 1 拷贝。
-- `autod.yml` 不在这张时序里：`autod` 直接向 `robotd` 订阅 `robot.state`、向 `tofd`
-  订阅 `tof.stream`，再直接发全部 intent；它没有 dora 输入/输出，也不经过 wrapper。
+- `autod.yml` 不在这张时序里：`robotd-state → robot_state → autod`、`tof → tof → autod`，
+  `autod` 再把 `cmd_vel/head/mouth/body/sound/skill` 发给 `wrapper`。source/sink 仍走
+  socket，但 `autod` 本身是普通 dora 节点。
 
 ## 4. 调用关系表
 
@@ -270,8 +272,11 @@ sequenceDiagram
 | dora `perception` | dora `brain` | `target = [visible, bearing, area]` | dora 消息 |
 | dora `robotd-state` | dora `brain` | `imu = [qw, qx, qy, qz, gx, gy, gz]` | dora 消息 |
 | dora `brain`（reactive.yml） | `robotd-wrapper` | `cmd_vel` | dora 消息 |
-| dora `autod`（autod.yml） | `robotd` | `robot.state` 订阅 / `robot.move`、`robot.head`、`robot.mouth`、`robot.pose`、`robot.sound`、`robot.do` | socket（订阅 + notification/request） |
-| `tofd` | dora `autod`（autod.yml） | `tof.stream` → `tof.frame` | socket 订阅 |
+| dora `autod`（autod.yml） | dora `robotd-wrapper` | `cmd_vel` / `head` / `mouth` / `body` / `sound` / `skill` | dora 消息 |
+| dora `robotd-state` | dora `autod` | `robot_state`（JSON） | dora 消息 |
+| dora `tof` | dora `autod` | `tof`（JSON `TofFrame`） | dora 消息 |
+| `tofd` | dora `tof` | `tof.stream` → `tof.frame` | socket 订阅 |
+| dora `robotd-wrapper` | `robotd` | `robot.move/head/mouth/pose/sound/do` | notification/request |
 | dora `keyboard` / `brain`（计划） | `intent arbiter` | `cmd_vel`（manual / auto） | dora 消息（计划） |
 | `intent arbiter`（计划） | `robotd-wrapper` | `cmd_vel` | dora 消息（计划） |
 | `updaterd` | `robotd` | `robot.health` | 请求/响应 |
@@ -297,5 +302,7 @@ sequenceDiagram
 - **跨机不共享内存。** `media.frame` 和 dora 的 SHM 都是同机路径；跨机走 WebRTC/网络。
 - **`sim.yml`、`reactive.yml` 和 `autod.yml` 互斥。** 键盘、reactive brain 和 autod 都写
   intent，同时运行是 last-writer-wins；arbiter 落地之前，手动接管要先停掉另外两张图。
+- **autod 自己不再开 socket。** `robotd-state`/`tof` 是 source，`wrapper` 是 sink；
+  `autod` 只消费/发布 dora topic。
 - **`brain` 不是安全层。** 它会在倾角/IMU 超时/目标丢失时发零，但真正的关节限位、跌倒
   失力和 deadman 仍在 `robotd`。

@@ -94,6 +94,9 @@ pub struct Sample {
 }
 
 impl Sample {
+    /// Kept from the upstream direct-socket port; the dora adapter builds `Sample` from the
+    /// compact `robot_state` message instead.
+    #[allow(dead_code)]
     pub fn of(state: &proto::RobotState) -> Self {
         let joint = |name: &str| {
             proto::JOINT_NAMES

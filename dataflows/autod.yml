@@ -1,24 +1,58 @@
-# Upstream autonomous brain (`autod`) as a dora node.
+# Upstream autonomous brain, split into dora nodes.
 #
 #   cargo build
 #   scripts/dora-sim autod
 #
-# This is the port of `pollen-robotics/microduck`'s `autod` branch
-# (`origin/autonomous-mode`, commit df9a750): a 12-state behaviour machine on
-# the energy/mood model, plus the ToF obstacle gate. Upstream deliberately left
-# BallPlay, Held, Startle and Preen behind; the 16-state runtime source is not
-# public.
+#   robotd-state ──robot_state──┐
+#                              ├──▶ autod ──cmd_vel / head / mouth / body / sound / skill──▶ wrapper
+#   tof ──────────tof───────────┘
 #
-# Unlike `reactive.yml`, this node owns the body and reads its sensors over the
-# same sockets the upstream daemon does:
+# `robotd-state` and `tof` are the only nodes with sockets (`ROBOTD_SOCKET` and `TOF_SOCKET`);
+# `autod` is the pure upstream state machine over dora messages, and `robotd-wrapper` is the
+# single intent sink. The brain itself is the 12-state port from
+# `pollen-robotics/microduck` `origin/autonomous-mode` (commit df9a750): BallPlay, Held,
+# Startle and Preen were already left behind upstream.
 #
-#   robotd ──robot.state──▶ dora-autod ──▶ robot.move / robot.head / robot.mouth
-#   tofd   ──tof.stream───▶              ──▶ robot.pose / robot.sound / robot.do
-#
-# `ROBOTD_SOCKET` is required; `TOF_SOCKET` is optional (without depth the
-# brain looks around but never advances). `scripts/dora-sim autod` sets both
-# and starts/reuses the twin. There is no keyboard in this graph and no pad
-# takeover yet: the first port does not wire `robot.state.move.source`.
+# `robot_state` is compact JSON from `dora-robotd-state`: t_ns, policy, fallen, sitting, head
+# joints, gravity, trunk height, odometry pose, and the subscribe ack's ground_pick/sitstand
+# abilities. `tof` is a serialized `TofFrame` from `dora-tof`. Without ToF the brain looks
+# around but never advances.
 nodes:
+  - id: robotd-state
+    path: ../target/debug/dora-robotd-state
+    inputs:
+      tick: dora/timer/millis/20
+    outputs:
+      - joint_state
+      - odom
+      - imu
+      - robot_state
+
+  - id: tof
+    path: ../target/debug/dora-tof
+    outputs:
+      - tof
+
   - id: autod
     path: ../target/debug/dora-autod
+    inputs:
+      tick: dora/timer/millis/20
+      robot_state: robotd-state/robot_state
+      tof: tof/tof
+    outputs:
+      - cmd_vel
+      - head
+      - mouth
+      - body
+      - sound
+      - skill
+
+  - id: robotd-wrapper
+    path: ../target/debug/dora-robotd-wrapper
+    inputs:
+      cmd_vel: autod/cmd_vel
+      head: autod/head
+      mouth: autod/mouth
+      body: autod/body
+      sound: autod/sound
+      skill: autod/skill

@@ -38,7 +38,7 @@ scripts/dora-sim run --stop-after 5
 scripts/dora-sim up | status | drive 0.3 | ctl health | down
 scripts/dora-sim camera           # OpenCV window over media.frame; starts the twin if needed
 scripts/dora-sim reactive         # camera -> perception -> brain; starts the target-scene twin
-scripts/dora-sim autod            # upstream 12-state brain + ToF; direct robotd/tofd sockets
+scripts/dora-sim autod            # upstream 12-state brain, split into dora nodes
 
 # Raw frames out of the dora camera node (one .uyvy + one .json per dump).
 DUCK_SIM_CAMERAS=a FRAME_DUMP_DIR=/tmp/duck-frames scripts/dora-sim run --stop-after 5
@@ -47,7 +47,7 @@ DUCK_SIM_CAMERAS=a FRAME_DUMP_DIR=/tmp/duck-frames scripts/dora-sim run --stop-a
 dora run dataflows/sim.yml
 dora run dataflows/sim.yml --stop-after 10   # 1.1.0 accepts bare seconds
 dora run dataflows/reactive.yml               # no keyboard; needs IMU and frames to move
-dora run dataflows/autod.yml                  # one node; needs ROBOTD_SOCKET, TOF_SOCKET optional
+dora run dataflows/autod.yml                  # robotd-state + tof + autod + wrapper
 
 # Inspect a graph without starting it
 dora graph dataflows/sim.yml --mermaid
@@ -56,11 +56,11 @@ dora graph dataflows/reactive.yml --mermaid
 
 - `dora run` starts an isolated local daemon and exits once the dataflow stops; `dora up` is not needed.
 - Per-run logs and the session file land in `dataflows/out/`, which is gitignored.
-- `cargo test --workspace` runs the keyboard parser tests plus the state/camera/frame-sink/perception/brain/autod unit tests; target one crate with `cargo test -p dora-keyboard`. The perception tests build synthetic UYVY frames (including the 90° mount mapping); the brain tests cover bearing sign, hysteresis, close/release, search timeout, stale IMU and tilt. `dora-autod` carries 20 tests copied with the upstream brain/obstacle code, including a ten-minute behaviour soak.
+- `cargo test --workspace` runs the keyboard parser tests plus the state/camera/frame-sink/perception/brain/autod/tof unit tests; target one crate with `cargo test -p dora-keyboard`. The perception tests build synthetic UYVY frames (including the 90° mount mapping); the brain tests cover bearing sign, hysteresis, close/release, search timeout, stale IMU and tilt. `dora-autod` carries the 20 upstream tests plus adapter tests, including a ten-minute behaviour soak.
 - `dora run dataflows/sim.yml --stop-after 4` without `ROBOTD_SOCKET`/`MEDIA_FRAME_SOCKET` is a graph-only smoke test: `robotd-state` logs that no state will be published, `camera` logs that no frames will be published, the wrapper logs one `cmd_vel … (no ROBOTD_SOCKET)` line, and without a controlling terminal the keyboard logs "keyboard disabled" and publishes zeros. That is expected. The real end-to-end test is `scripts/dora-sim run --stop-after 5`, which should show `dora-robotd-state: subscribed to …` and `published N robot states`, then stop the twin cleanly. Add `DUCK_SIM_CAMERAS=a` to exercise `dora-camera`; that path needs GStreamer, and `duck-sim` refuses to start a camera without it.
 - `dora run dataflows/reactive.yml --stop-after 4` without sockets is the graph-only autonomous smoke test: the wrapper logs one zero `cmd_vel`, `camera`/`robotd-state` log their missing sockets, and `brain` stays in `mode=no-imu` because `BRAIN_REQUIRE_IMU` defaults to 1. That is deliberate: the brain must not drive without state. `BRAIN_REQUIRE_IMU=0` is only for isolating the graph.
 - `scripts/dora-sim reactive --stop-after 12` is the end-to-end autonomy test: it copies `scenes/scene_target.xml` next to the simulator's robot model, starts the twin with `DUCK_SIM_SCENE=target DUCK_SIM_KEYFRAME=HOME DUCK_SIM_CAMERAS=a`, and should log `visible=true`, `mode=turn`, `mode=forward`, then `mode=arrived`; the odom should move forward and then stop. It stops the twin on exit only if it started it.
-- `scripts/dora-sim autod --stop-after 60` is the upstream-port test: it should start/reuse the twin, set `ROBOTD_SOCKET`/`TOF_SOCKET`, log `depth frames arriving — obstacle avoidance on`, and emit several `→ state=...` transitions (LookAround, Chill, Dance, Zoomies, Wander are all plausible); odom should move. Use `DUCK_SIM_VIEWER=0` when the macOS MuJoCo window hangs. The node handles `Event::Stop` and sends one zero `robot.move`, so `--stop-after` exits without dora's kill grace.
+- `scripts/dora-sim autod --stop-after 20` is the upstream-port test: it should start/reuse the twin, set `ROBOTD_SOCKET`/`TOF_SOCKET`, log `dora-tof: connected`/frame lines and `dora-autod: first state ... abilities ...`, emit `→ state=...` transitions (Ruffle/LookAround/Chill/Wander are plausible in 20 s), and move odom when Wander starts. The wrapper should connect and receive `cmd_vel/head/mouth/body/sound`. Use `DUCK_SIM_VIEWER=0` when the macOS MuJoCo window hangs.
 - `scripts/dora-sim run` is the end-to-end launcher test: it should print "standing", connect the wrapper to `target/duck-sim/state/duck-a.sock`, run the dataflow, then "stopping the MuJoCo twin" with no leftover processes.
 
 ## Architecture
@@ -75,13 +75,13 @@ dora graph dataflows/reactive.yml --mermaid
 ### Nodes
 
 - `crates/dora-keyboard` — reads keys from `/dev/tty` (dora gives nodes a null stdin) and publishes `cmd_vel` (`[vx, vy, vyaw]`) on a 50 ms tick. Hold to move: W/S vx, A/D vy, Q/E yaw; X stops immediately. Terminals report no key-up, so a key is held while it repeats — the first window is 800 ms to cover the OS repeat delay, then 250 ms once repeats are flowing. Each axis times out on its own: a key on one axis must not keep another axis's last value alive. Ctrl-C quits and restores the terminal, then signals dora's process group so one press stops the dataflow. Arrow and space sequences are swallowed on purpose — the MuJoCo viewer binds them to stepping and pausing. The parser consumes whole escape sequences (CSI with parameters, SS3, `ESC`+key) rather than one byte after `ESC [`, because a stray final `D` would strafe. dora can spawn the node in a background process group, so it claims the tty's foreground group and restores it on exit; `first key received` in the node log confirms input works. Defaults are 0.30 forward, 0.40 backward, 0.50 strafe and 1.50 yaw: every axis has a deadband (about 0.25 m/s forward, 0.30–0.35 backward, ~0.4 m/s strafe), and below ~1.2 rad/s it barely yaws, so smaller "gentle" values only wobble the duck. Backward needs more than forward: −0.30 moves nothing at all. Without a tty it warns and publishes zeros.
-- `crates/dora-robotd-state` — subscribes to `robot.subscribe` on `ROBOTD_SOCKET` and publishes the measured state on a 20 ms tick: `joint_state` (15 `f32`), `odom` (`[x, y, z, yaw]`) and `imu` (`[qw, qx, qy, qz, gx, gy, gz]`). A reader thread reconnects and resubscribes when robotd restarts; with `ROBOTD_SOCKET` unset it logs and publishes nothing.
+- `crates/dora-robotd-state` — subscribes to `robot.subscribe` on `ROBOTD_SOCKET` and publishes the measured state on a 20 ms tick: `joint_state` (15 `f32`), `odom` (`[x, y, z, yaw]`), `imu` (`[qw, qx, qy, qz, gx, gy, gz]`) and `robot_state` (compact JSON: `t_ns`, policy, fallen, sitting, head joints, gravity, trunk height, pose, and the subscribe ack's `ground_pick`/`sitstand` abilities). A reader thread reconnects and resubscribes when robotd restarts; with `ROBOTD_SOCKET` unset it logs and publishes nothing.
 - `crates/dora-camera` — pulls `media.frame` on `MEDIA_FRAME_SOCKET` at 33 ms, writes the raw UYVY bytes straight into a dora sample (IPC header first, then `read_exact` into the sample's data region), and publishes `image` with `width`/`height`/`format`/`rotate` metadata. `media.frame` answers one frame per connection, so the node reconnects each tick and logs only the first connection (or a recovery). It installs a warn-level tracing subscriber so dora's own `zenoh direct path` / `daemon path` diagnostics are visible. With the socket unset it logs and publishes nothing.
 - `crates/dora-perception` — consumes `image` and publishes `target` as `f32[3]` (`[visible, bearing (-1 left, +1 right), area fraction]`). It is a colour threshold, not a model: UYVY chroma for saturated orange/red, centroid of matching pixels, minimum area `PERCEPTION_MIN_AREA` (default 0.001). It reads `width`/`height`/`format`/`rotate` metadata and maps raw coordinates into the upright image before computing bearing (`rotate=90` means `x_upright = height - 1 - y_raw`), so the 460 KB frame is never rotated. Thresholds are `PERCEPTION_V_MIN`/`U_MAX`/`Y_MIN`. Invalid frames are logged and not published.
 - `crates/dora-brain` — consumes `target` and `imu`, publishes `cmd_vel` at 50 ms. It is a reactive v0, not the 16-state brain: bang-bang turn/forward with hysteresis (`BRAIN_ALIGN_START=0.45`, `BRAIN_ALIGN_STOP=0.30`), close latch (`BRAIN_CLOSE_AREA=0.06`, release `0.02`), target timeout 300 ms, search right for up to `BRAIN_SEARCH_MS` (8 s), tilt limit 45°, and IMU timeout 500 ms. `BRAIN_REQUIRE_IMU=1` default refuses to drive without state. Positive bearing (target right) produces negative `vyaw` because `robot.move` defines positive yaw as left. Values are intentionally at the policy's deadband edges, not "gentle".
 - `crates/dora-frame-sink` — debug consumer for `image` in `sim.yml`: reads the `UInt8Array` in place and logs every 30th frame. It exercises the shared-memory path and is the frame-dump tool. Set `FRAME_DUMP_DIR` (with `FRAME_DUMP_EVERY`, default 30, and `FRAME_DUMP_LIMIT`, default 10; 0 = unlimited) to write the raw UYVY frames plus a `.json` sidecar; this is a debug path, not the production route.
 - `crates/dora-mujoco-bridge` — a deterministic synthetic gait over the 15 joints, retained as a graph-only stub. It is **not** in `dataflows/sim.yml`: the upstream twin already runs the real `robotd` against MuJoCo, and a second simulator in the graph would disagree with it.
-- `crates/dora-robotd-wrapper` — turns `cmd_vel` into a `robot.move` JSON-RPC notification on `ROBOTD_SOCKET` (only logged when unset). It is a pure intent sink; state lives in `dora-robotd-state`.
+- `crates/dora-robotd-wrapper` — the single intent sink. `cmd_vel` becomes `robot.move`; `head`/`mouth`/`body`/`sound` become `robot.head`/`mouth`/`pose`/`sound` notifications; `skill` becomes a `robot.do` request and its reply is logged. Only inputs connected in a graph are sent; with `ROBOTD_SOCKET` unset every intent is logged once (`cmd_vel` when it changes). State lives in `dora-robotd-state`.
 
 ### Dataflow
 
@@ -113,6 +113,20 @@ camera ──image (SHM)──▶ perception ──target──▶ brain ──c
 - `target` is `f32[3]`; `imu` is `f32[7]`; `cmd_vel` is `f32[3]`.
 - `scripts/dora-sim reactive` sets `DUCK_SIM_SCENE=target`, `DUCK_SIM_KEYFRAME=HOME`, `DUCK_SIM_CAMERAS` to the selected duck's letter (unless overridden), copies `scenes/scene_target.xml` to the simulator's robot directory, and exports `MEDIA_FRAME_SOCKET`.
 - Do not run `sim.yml`, `reactive.yml` and `autod.yml` against the same robot: each writes intents, and `autod` writes the whole body. An arbiter is the next step.
+
+`dataflows/autod.yml` is the upstream brain as four nodes:
+
+```
+robotd-state ──robot_state──▶ autod ──cmd_vel/head/mouth/body/sound/skill──▶ robotd-wrapper
+tof          ──tof──────────▶
+```
+
+- `robotd-state` and `tof` are the only source nodes with sockets; `autod` is pure dora; the
+  wrapper is the sink. `tof`'s JSON is the `duck_ipc_proto::TofFrame`, so the wire contract is
+  not duplicated.
+- `autod` calls the brain only on its 20 ms tick, and sends nothing while `busy`/`off` or while
+  `robot_state` is older than 500 ms, so it does not fight a skill, a disabled policy, or a dead
+  state stream (the deadman stops the duck).
 - The target scene has no keyframes; `HOME` is a placement, not a keyframe. The copied file must sit next to `robot_groundcontact.xml` because its `meshdir="assets"` is relative to that directory. `scene_ball.xml`'s ball is kicked away on startup and is not a stable perception target.
 
 ### Simulation launcher (A1)
@@ -127,7 +141,7 @@ camera ──image (SHM)──▶ perception ──target──▶ brain ──c
 
 `scripts/dora-sim camera` is a separate viewer, not part of the dataflow: it starts the twin with `DUCK_SIM_CAMERAS` set to the selected duck's letter if none is running, then runs `scripts/duck-camera-view` (Python + OpenCV) against `media.frame`. If it started the twin, the exit trap stops it; an already-running twin is left alone. The viewer is a debug tool, not a dora node. It does **not** run dora or the keyboard: to walk while watching, run `scripts/dora-sim run` and `scripts/dora-sim camera` in two terminals and focus the dora terminal before pressing keys, or use `scripts/dora-sim drive`. The view is portrait because the camera is mounted 90°; the `apartment` scene currently segfaults `body_server` on macOS, so the default scene is the safe one.
 
-`scripts/dora-sim autod` is the upstream-brain launcher: it builds `dora-autod`, starts/reuses the twin, exports the absolute `ROBOTD_SOCKET` and `TOF_SOCKET` (`target/duck-sim/state/duck-a-tof.sock`), and runs `dora run dataflows/autod.yml`. It has no keyboard and does not need GStreamer. `DUCK_SIM_VIEWER=0` avoids the macOS MuJoCo window when it hangs. A twin started without ToF cannot support it (the node only looks around); the launcher dies if the ToF socket is absent.
+`scripts/dora-sim autod` is the upstream-brain launcher: it builds `dora-robotd-state`, `dora-tof`, `dora-autod` and `dora-robotd-wrapper`, starts/reuses the twin, exports the absolute `ROBOTD_SOCKET` and `TOF_SOCKET` (`target/duck-sim/state/duck-a-tof.sock`), and runs `dora run dataflows/autod.yml`. It has no keyboard and does not need GStreamer. `DUCK_SIM_VIEWER=0` avoids the macOS MuJoCo window when it hangs. A twin started without ToF cannot support it (the brain only looks around); the launcher dies if the ToF socket is absent.
 
 `scripts/dora-sim reactive` is the autonomy launcher. It builds the reactive nodes, copies `scenes/scene_target.xml` into the extracted simulator's `robot/microduck/` directory (next to `robot_groundcontact.xml`, because the included model's `meshdir` is relative), and starts/reuses the twin with `DUCK_SIM_SCENE=target`, `DUCK_SIM_KEYFRAME=HOME`, `DUCK_SIM_CAMERAS=a` unless those are already set. It exports `MEDIA_FRAME_SOCKET` and runs `dora run dataflows/reactive.yml`. If a twin was already running with another scene it warns and reuses it; the brain then has no orange target and falls back to search. It stops the twin on exit only if it started it. The target is a fixed orange sphere at 0.8 m, no collision and no freejoint, so it stays visible instead of being kicked away like `scene_ball.xml`.
 

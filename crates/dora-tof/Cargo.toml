@@ -1,0 +1,13 @@
+[package]
+name = "dora-tof"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Dora node that turns tofd's tof.stream into a dora topic"
+publish = false
+
+[dependencies]
+dora-node-api.workspace = true
+duck-ipc-proto.workspace = true
+eyre.workspace = true
+serde_json.workspace = true

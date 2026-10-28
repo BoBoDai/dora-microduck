@@ -11,6 +11,8 @@ license = "Apache-2.0"
 dora-node-api.workspace = true
 duck-ipc-proto.workspace = true
 kinematics.workspace = true
+eyre.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -18,6 +18,10 @@
 //!   order.
 //! - `odom`: `[x, y, z, yaw]` in the odometry frame, metres and radians.
 //! - `imu`: `[qw, qx, qy, qz, gx, gy, gz]` when the daemon reports an IMU.
+//! - `robot_state`: a compact JSON snapshot for behaviour nodes: `t_ns`, policy, fallen,
+//!   sitting, the four measured head joints, projected gravity, trunk height, odometry pose and
+//!   the subscribe ack's `ground_pick`/`sitstand` abilities. It is small and stable; the
+//!   behaviour node does not need the whole `RobotState` (skeleton, currents, frames).
 
 use dora_node_api::{DoraNode, Event, IntoArrow, dora_core::config::DataId};
 use duck_ipc_proto::RobotState;
@@ -33,10 +37,23 @@ const TICK: &str = "tick";
 const JOINT_STATE: &str = "joint_state";
 const ODOM: &str = "odom";
 const IMU: &str = "imu";
+const ROBOT_STATE: &str = "robot_state";
 const SUBSCRIBE_HZ: u32 = 50;
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
-type Latest = Arc<Mutex<Option<Arc<RobotState>>>>;
+#[derive(Clone, Copy, Debug, Default)]
+struct Abilities {
+    ground_pick: bool,
+    sit_stand: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Snapshot {
+    state: Option<Arc<RobotState>>,
+    abilities: Abilities,
+}
+
+type Latest = Arc<Mutex<Snapshot>>;
 
 /// Keeps a subscription alive, reconnecting when `robotd` goes away.
 fn spawn_reader(path: PathBuf, latest: Latest) {
@@ -71,7 +88,7 @@ fn spawn_reader(path: PathBuf, latest: Latest) {
 }
 
 /// One subscription, until the connection closes or fails.
-fn subscribe(path: &Path, latest: &Mutex<Option<Arc<RobotState>>>) -> Result<()> {
+fn subscribe(path: &Path, latest: &Mutex<Snapshot>) -> Result<()> {
     let mut stream = UnixStream::connect(path)
         .wrap_err_with(|| format!("connect to robotd at {}", path.display()))?;
     eprintln!("dora-robotd-state: subscribed to {}", path.display());
@@ -92,16 +109,35 @@ fn subscribe(path: &Path, latest: &Mutex<Option<Arc<RobotState>>>) -> Result<()>
         }
         match state_from_line(&line) {
             Ok(Some(state)) => {
-                *latest.lock().expect("state mutex poisoned") = Some(Arc::new(state));
+                latest.lock().expect("state mutex poisoned").state = Some(Arc::new(state));
             }
             // The `robot.subscribe` acknowledgement, or a reply to some other
             // request on the same connection.
             Ok(None) => {}
             Err(err) => eprintln!("dora-robotd-state: {err}"),
         }
+        if let Some(abilities) = abilities_from_line(&line) {
+            latest.lock().expect("state mutex poisoned").abilities = abilities;
+        }
     }
 
     Ok(())
+}
+
+/// The `robot.subscribe` ack: which one-shot abilities this robot loaded.
+fn abilities_from_line(line: &str) -> Option<Abilities> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    value.get("id")?;
+    let result = value.get("result")?;
+    if result.is_null() {
+        return None;
+    }
+    Some(Abilities {
+        ground_pick: result
+            .get("ground_pick")
+            .is_some_and(|value| !value.is_null()),
+        sit_stand: result.get("sitstand").is_some_and(|value| !value.is_null()),
+    })
 }
 
 /// A `robot.state` notification, or `None` for anything else on the line.
@@ -133,6 +169,39 @@ fn odom(state: &RobotState) -> Vec<f32> {
     vec![x as f32, y as f32, z as f32, state.odom.yaw as f32]
 }
 
+/// The four head joints in the order the brain and ToF reprojection expect.
+fn head_joints(state: &RobotState) -> [f64; 4] {
+    let joint = |name: &str| {
+        duck_ipc_proto::JOINT_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .and_then(|index| state.joints.get(index).copied())
+            .unwrap_or(0.0)
+    };
+    [
+        joint("neck_pitch"),
+        joint("head_pitch"),
+        joint("head_yaw"),
+        joint("head_roll"),
+    ]
+}
+
+/// The compact state message `dora-autod` consumes.
+fn brain_state(state: &RobotState, abilities: Abilities) -> serde_json::Value {
+    serde_json::json!({
+        "t_ns": state.t_ns,
+        "policy": state.policy,
+        "fallen": state.safety.fallen,
+        "sitting": matches!(state.policy.as_str(), "sit" | "seated"),
+        "head": head_joints(state),
+        "gravity": state.safety.gravity,
+        "trunk_height_m": (state.odom.position[2] > 0.02).then_some(state.odom.position[2]),
+        "pose": [state.odom.position[0], state.odom.position[1], state.odom.yaw],
+        "can_ground_pick": abilities.ground_pick,
+        "can_sit_stand": abilities.sit_stand,
+    })
+}
+
 fn imu(state: &RobotState) -> Option<Vec<f32>> {
     let imu = state.imu?;
     let [qw, qx, qy, qz] = imu.quat;
@@ -144,7 +213,7 @@ fn imu(state: &RobotState) -> Option<Vec<f32>> {
 
 fn main() -> Result<()> {
     let (mut node, mut events) = DoraNode::init_from_env()?;
-    let latest: Latest = Arc::new(Mutex::new(None));
+    let latest: Latest = Arc::new(Mutex::new(Snapshot::default()));
 
     match std::env::var_os("ROBOTD_SOCKET") {
         Some(path) => spawn_reader(PathBuf::from(path), Arc::clone(&latest)),
@@ -157,8 +226,8 @@ fn main() -> Result<()> {
     while let Some(event) = events.recv() {
         match event {
             Event::Input { id, metadata, .. } if id.as_str() == TICK => {
-                let state = latest.lock().expect("state mutex poisoned").clone();
-                let Some(state) = state else {
+                let snapshot = latest.lock().expect("state mutex poisoned").clone();
+                let Some(state) = snapshot.state else {
                     continue;
                 };
                 let Some(joints) = joint_state(&state) else {
@@ -194,6 +263,13 @@ fn main() -> Result<()> {
                     DataId::from(ODOM.to_owned()),
                     metadata.parameters.clone(),
                     odom.into_arrow(),
+                )?;
+                let state_message = brain_state(&state, snapshot.abilities);
+                let state_bytes = serde_json::to_vec(&state_message)?;
+                node.send_output(
+                    DataId::from(ROBOT_STATE.to_owned()),
+                    metadata.parameters.clone(),
+                    state_bytes.into_arrow(),
                 )?;
                 if let Some(imu) = imu(&state) {
                     node.send_output(
@@ -256,6 +332,35 @@ mod tests {
     #[test]
     fn rejects_a_wrong_joint_count() {
         assert!(joint_state(&state(vec![0.0; 14])).is_none());
+    }
+
+    #[test]
+    fn reads_abilities_from_the_subscribe_ack() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"result":{"accepted":true,"ground_pick":"alpha_ground_pick.onnx","sitstand":"alpha_sitstand.onnx"}}"#;
+        let abilities = abilities_from_line(line).expect("an ack");
+        assert!(abilities.ground_pick && abilities.sit_stand);
+
+        let missing = r#"{"jsonrpc":"2.0","id":1,"result":{"accepted":true}}"#;
+        let abilities = abilities_from_line(missing).expect("an ack");
+        assert!(!abilities.ground_pick && !abilities.sit_stand);
+        assert!(abilities_from_line(r#"{"jsonrpc":"2.0","method":"robot.state"}"#).is_none());
+    }
+
+    #[test]
+    fn builds_the_compact_brain_state() {
+        let state = state(vec![0.0; 15]);
+        let value = brain_state(
+            &state,
+            Abilities {
+                ground_pick: true,
+                sit_stand: false,
+            },
+        );
+        assert_eq!(value["policy"], "stand");
+        assert_eq!(value["pose"], serde_json::json!([1.0, 2.0, 0.5]));
+        assert_eq!(value["head"], serde_json::json!([0.0, 0.0, 0.0, 0.0]));
+        assert_eq!(value["can_ground_pick"], true);
+        assert_eq!(value["can_sit_stand"], false);
     }
 
     #[test]

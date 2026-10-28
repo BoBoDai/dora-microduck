@@ -16,6 +16,7 @@
 │   ├── dora-perception/        # image → target（可见 / 方位 / 面积）
 │   ├── dora-brain/             # target + imu → cmd_vel
 │   ├── dora-autod/             # 上游 autod：12 状态行为机 + ToF 避障
+│   ├── dora-tof/               # tof.stream → dora topic
 │   ├── dora-frame-sink/        # 调试消费者：原地读 image，不拷贝
 │   ├── dora-robotd-wrapper/    # cmd_vel → robot.move
 │   ├── dora-keyboard/          # 终端键盘 → cmd_vel
@@ -23,7 +24,7 @@
 ├── dataflows/
 │   ├── sim.yml                 # 遥操作：键盘 + 相机调试消费者
 │   ├── reactive.yml            # 反应式行为：camera → perception → brain
-│   └── autod.yml               # 上游 autod 大脑（单节点，直连 robotd/tofd）
+│   └── autod.yml               # 上游 autod 大脑拆成 dora 节点
 ├── scenes/
 │   └── scene_target.xml        # 演示用世界：鸭子前方 0.8 m 一个固定橙色目标
 ├── docs/
@@ -239,7 +240,7 @@ scripts/dora-sim autod --stop-after 30
 DUCK_SIM_VIEWER=0 scripts/dora-sim autod   # 不弹 MuJoCo 窗口
 ```
 
-这不是 `reactive.yml` 的放大版，而是把上游 `autod` 原样移植成一个 dora 节点。源分支是
+这不是 `reactive.yml` 的放大版，而是把上游 `autod` 的行为机移植进 dora。源分支是
 `pollen-robotics/microduck` 的 `origin/autonomous-mode`，提交 `df9a750`；`brain.rs` 和
 `obstacle.rs` 是上游代码，保留 Apache-2.0 许可证（`crates/dora-autod/LICENSE`）。
 
@@ -268,19 +269,24 @@ grid**（0.5 m 格子、约 15 分钟衰减）、**ToF 避障**（新鲜度、�
 
 ### 数据流形状
 
-`autod.yml` 只有一个节点，和上游 daemon 一样直接连 socket：
+`autod.yml` 是四个 dora 节点，状态和 ToF 都走 topic：
 
 ```
-robotd ──robot.state（50 Hz）──┐
-                               ├──▶ dora-autod ──▶ robot.move / robot.head / robot.mouth
-tofd   ──tof.stream（15 Hz）───┘                └──▶ robot.pose / robot.sound / robot.do
+dora-robotd-state ──robot_state──┐
+                                 ├──▶ dora-autod ──cmd_vel / head / mouth / body / sound / skill──▶ wrapper
+dora-tof          ──tof──────────┘
 ```
 
-- `ROBOTD_SOCKET` 必需；`TOF_SOCKET` 可选，但没有 ToF 时它只张望、不前进（上游规则：
-  没看过的路不走）。
-- `scripts/dora-sim autod` 会设置两个 socket，并启动/复用 twin。
-- 它**直接发 intent**，不经过 `robotd-wrapper`；这是第一版为了保持上游形状。之后可以把
-  `robot.state` 和 `tof.stream` 拆成 dora topic，让图里能看见它们。
+- `dora-robotd-state` 新增 `robot_state`：`t_ns`、policy、fallen、sitting、四个头部关节、
+  gravity、trunk height、odom pose，以及 subscribe ack 里的 `ground_pick`/`sitstand` 能力。
+- `dora-tof` 连 `TOF_SOCKET`，把 `tof.stream` 的 `TofFrame` 原样发布成 `tof`。没有
+  `TOF_SOCKET` 时它只打印日志；brain 于是只张望、不前进（上游规则）。
+- `dora-autod` 不再开 socket：它保存最近一秒的 state，按 `t_ns` 把 ToF 帧和最近的 state
+  配对，跑 `Brain::step`，发布 intent。
+- wrapper 是唯一 intent sink：`cmd_vel → robot.move`，`head → robot.head`，
+  `mouth → robot.mouth`，`body → robot.pose`，`sound → robot.sound`，`skill → robot.do`。
+- `robot_state` 超过 500 ms 没更新时，autod 不再发布任何 intent，让 `robotd` 的 deadman
+  停下；state 恢复后自动继续。
 - 它不读相机，也不需要 GStreamer；相机链路和 `reactive.yml` 是另一条。
 
 ### 当前没接的部分
@@ -294,15 +300,17 @@ tofd   ──tof.stream（15 Hz）───┘                └──▶ robot
 - **v38 的 `robot.head alpha`**：主分支 proto 没有这个字段，快速甩头的幅度会被 `robotd`
   的默认平滑吃掉。
 - **BallPlay/Held/Startle/Preen**：上游自己也没带，见上。
-- **dora 化**：状态/ToF 仍走 Unix socket，不是 dora topic；这是下一步，不是已完成。
+- **socket 只留在 source/sink**：`robotd-state` 和 `tof` 仍需 socket 读传感器，
+  `wrapper` 仍需 socket 发 intent；`autod` 本身已经完全走 dora topic。
 
 ### 验收
 
-`cargo test -p dora-autod` 跑了上游的 20 个测试：十分钟行为不越界、Wander 走到目标、目标
-避开障碍、没有 ToF 时绝不前进、GroundPick 等待真正执行、坐着的人会被站起来、声音回答等。
-本机 `scripts/dora-sim autod --stop-after 60` 实测依次出现 `LookAround → Chill → Dance →
-Zoomies → LookAround → TurnInPlace → Wander`，odom 有位移，ToF 日志出现
-`depth frames arriving — obstacle avoidance on`，没有协议拒绝。
+`cargo test -p dora-autod` 跑了上游的行为/避障测试（十分钟行为不越界、Wander 走到目标、
+目标避开障碍、没有 ToF 时绝不前进、GroundPick 等待真正执行、坐着的人会被站起来、声音回答
+等），加上新的 state 解析测试。本机 `scripts/dora-sim autod --stop-after 20` 实测：
+`dora-tof: connected` 和 frame 日志出现，state 日志出现 `policy=stand abilities ...`，行为
+依次出现 `Ruffle → LookAround → Chill → Wander`，Wander 后 odom x 从约 0.07 到 0.29 m；
+wrapper 成功连上 robotd，没有类型错误或协议拒绝。更长运行时状态/odom 也会继续变化。
 
 ## 手动分步运行
 
@@ -335,14 +343,15 @@ dora run dataflows/reactive.yml
 拓扑是 `camera → perception → brain → robotd-wrapper`，再加上 `robotd-state → brain` 的 IMU；
 没有键盘。两张图不要同时跑，原因见上面的“边界”。
 
-上游 autod 是第三张图，只有一个节点：
+上游 autod 是第三张图，四个节点：
 
 ```bash
 ROBOTD_SOCKET=... TOF_SOCKET=... dora run dataflows/autod.yml
 ```
 
-它自己连 socket；`scripts/dora-sim autod` 会把两个地址设好。也不要和 `sim.yml`/`reactive.yml`
-同时跑：它直接写所有 intent。
+`robotd-state`/`tof` 读 socket，`autod` 走 dora topic，`wrapper` 写 intent；
+`scripts/dora-sim autod` 会把两个地址设好。也不要和 `sim.yml`/`reactive.yml` 同时跑：
+它写全部 intent。
 
 ## 键盘遥操作
 
@@ -402,7 +411,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `cargo test --workspace` 覆盖键盘解析、状态节点的解析/转换、相机节点的协议头解析、帧导出逻辑、
 perception 的 UYVY 检测/旋转映射、brain 的转向/前进/到达/搜索/倾角逻辑，以及 autod 的
-20 个上游行为/避障测试。端到端 smoke test：
+21 个行为/避障/adapter 测试。端到端 smoke test：
 
 ```bash
 scripts/dora-sim run --stop-after 5
@@ -421,13 +430,13 @@ scripts/dora-sim run --stop-after 5
 - `dora-camera`：通过 `media.frame` 拉取原始 UYVY 帧，直接写进 SHM sample；`shared_memory_pool_size: 64MB`。已在真实 sim 相机上验证（640×360、30 fps、`zenoh direct path` + SHM）；`scripts/dora-sim camera` 直接看画面，`FRAME_DUMP_DIR` 导出帧。
 - `dora-perception`：橙色目标阈值 + 质心，发布 `target = [visible, bearing, area]`；按 `rotate` 把原始坐标映射到转正后的水平轴，不旋转整帧。
 - `dora-brain`：反应式行为 v0；转向/前进/到达/搜索，带方位滞回、目标超时、IMU 倾角和 `arrived` 锁定。已在 `target` 场景上跑通：找到目标 → 前进约 0.3 m → 停下保持。
-- `dora-autod`：上游 `autod` 的行为机移植（12 状态、energy/mood、novelty grid、ToF 避障），作为单个 dora 节点直接连 `robotd`/`tofd`。已在 sim 上跑出 Chill/LookAround/Dance/Zoomies/Wander 和位移；20 个上游测试通过。见上面的“上游 autod 的 12 状态大脑”。
+- `dora-autod`：上游 `autod` 的行为机移植（12 状态、energy/mood、novelty grid、ToF 避障）。已经拆成 `robotd-state → autod ← tof` 和 `autod → wrapper` 的 dora 图；已在 sim 上跑出 Ruffle/LookAround/Chill/Wander 和位移，wrapper 接收 `cmd_vel/head/mouth/body/sound/skill`。见上面的“上游 autod 的 12 状态大脑”。
+- `dora-tof`：连 `TOF_SOCKET`，把 `tof.stream` 发布成 dora `tof` topic；`dora-robotd-state` 新增 `robot_state` topic。
 - `dora-frame-sink`：调试消费者，原地读 `Uint8Array` 并打印帧信息；支持 `FRAME_DUMP_DIR` 导出。它和 `perception` 分别属于 `sim.yml` 和 `reactive.yml`。
 - `dora-mujoco-bridge`：仍是确定性合成步态的 stub，已从数据流移除；上游 twin 的 MuJoCo 才是仿真来源。
 
-下一步是把 autod 的 `robot.state`/`tof.stream` 拆成 dora topic、补上手柄接管/音频输入，
-再做 intent arbiter（键盘、reactive brain、autod 安全共存）、NPU 鸭子检测器，以及上游
-故意没带的四个状态；见 `docs/architecture.md` §4。
+下一步是补上手柄接管/音频输入，再做 intent arbiter（键盘、reactive brain、autod 安全
+共存）、NPU 鸭子检测器，以及上游故意没带的四个状态；见 `docs/architecture.md` §4。
 
 ## 调试：导出 dora 收到的相机帧
 
@@ -482,10 +491,10 @@ open /tmp/frame.png
 都会写 intent，同时运行是 last-writer-wins。先停掉一张图；下一步会加 intent arbiter。
 
 **`scripts/dora-sim autod` 里鸭子只张望不走？**
-看日志有没有 `depth frames arriving — obstacle avoidance on`。没有 ToF 时 autod 只转向、
-不前进（上游规则）。还要确认 `robot.state.policy` 是 `walk`/`stand`；如果机器人是坐着的、
-`held` 或刚被别的客户端禁用，autod 会等。默认场景的 twin 由 `scripts/dora-sim` 站起来；
-真机需要先 Start 或 `robotctl robot enable`。另外手柄接管还没接，跑 autod 时不要同时用手柄。
+看日志有没有 `dora-tof: connected` 和 `dora-tof: frame`。没有 ToF 时 autod 只转向、不前进
+（上游规则）。还要确认 `robot.state.policy` 是 `walk`/`stand`；如果机器人是坐着的、`held`
+或刚被别的客户端禁用，autod 会等。默认场景的 twin 由 `scripts/dora-sim` 站起来；真机需要
+先 Start 或 `robotctl robot enable`。另外手柄接管还没接，跑 autod 时不要同时用手柄。
 
 **`DUCK_SIM_SCENE=apartment` 起不来？**
 当前 macOS + microduck_rl 的 `apartment` 场景会让 MuJoCo `body_server` segfault；用默认场景即可。
